@@ -87,22 +87,38 @@ if "code" in query_params:
             ll_res = requests.get(ll_url, params=ll_params).json()
             access_token = ll_res.get("access_token")  # ACCESS TOKEN
             
-            # STEP 3: Get User Profile Details (Added Image field)
+            # STEP 3: Fetch Basic Identity
             st.write("👤 Fetching Profile Details...")
-            me_url = f"https://graph.instagram.com/{API_VERSION}/me?fields=user_id,username,name,followers_count,profile_picture_url&access_token={access_token}"
-            user_data = requests.get(me_url).json()
-            
-            user_id = user_data.get("user_id")
-            username = user_data.get("username")
-            name = user_data.get("name", "Instagram User")
-            followers = user_data.get("followers_count", 0)
-            profile_pic = user_data.get("profile_picture_url")
+            me_url = (
+                f"https://graph.instagram.com/{API_VERSION}/me"
+                f"?fields=id,user_id,username,name"
+                f"&access_token={access_token}"
+            )
+            me_data = requests.get(me_url).json()
+            app_id = me_data.get("id")
+            user_id = me_data.get("user_id")
+            username = me_data.get("username")
+            name = me_data.get("name", "Instagram User")
+
+            # STEP 4: Fetch Professional Account Data
+            prof_url = (
+                f"https://graph.instagram.com/{API_VERSION}/{user_id}"
+                f"?fields=account_type,profile_picture_url,followers_count,follows_count,media_count"
+                f"&access_token={access_token}"
+            )
+            prof = requests.get(prof_url).json()
+
+            account_type = prof.get("account_type")
+            profile_pic = prof.get("profile_picture_url")
+            followers = prof.get("followers_count", 0)
+            follows = prof.get("follows_count", 0)
+            media_count = prof.get("media_count", 0)
 
             print(f"--- TERMINAL: USER CONNECTED ---")
             print(f"Name: {name} | Username: @{username}")
-            print(f"User ID: {user_id} | Followers: {followers}")
+            print(f"IG User ID: {user_id} | Followers: {followers} | Media: {media_count}")
 
-            # STEP 4: Run Multi-Range Reports
+            # STEP 5: Run Multi-Range Reports
             report_7 = fetch_instagram_metrics(access_token, user_id, 7, followers)
             report_30 = fetch_instagram_metrics(access_token, user_id, 30, followers)
             report_90 = fetch_instagram_metrics(access_token, user_id, 90, followers)
@@ -112,18 +128,18 @@ if "code" in query_params:
             # --- DISPLAY DASHBOARD ---
             st.divider()
             
-            # Profile Header Section
             col_img, col_info = st.columns([1, 4])
             with col_img:
-                if profile_pic:
-                    st.image(profile_pic, width=120)
-                else:
-                    st.write("👤 (No Profile Image)")
+                st.image(profile_pic, width=120) if profile_pic else st.write("👤 (No Profile Image)")
             
             with col_info:
                 st.subheader(f"{name} (@{username})")
-                st.write(f"**User ID:** `{user_id}`")
+                st.write(f"**App ID:** `{app_id}`")
+                st.write(f"**IG User ID:** `{user_id}`")
+                st.write(f"**Account Type:** `{account_type}`")
                 st.write(f"**Followers:** {followers:,}")
+                st.write(f"**Following:** {follows:,}")
+                st.write(f"**Media Count:** {media_count:,}")
 
             st.divider()
 
@@ -142,9 +158,8 @@ if "code" in query_params:
             with tab2:
                 st.json(report_90['totals'])
 
-            # --- STEP 5: COSHOT DEEP LINK BUTTON ---
+            # CoShot Deep Link Stuff
             refresh_url = f"https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token={access_token}"
-
             from urllib.parse import quote
             deep_link = (
                 "coshot://callback?"
