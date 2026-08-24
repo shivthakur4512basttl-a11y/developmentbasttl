@@ -763,7 +763,7 @@ def render_post_card(post: dict, rank: int, extras: dict) -> str:
     if ex.get("profile_visits"):
         chips += f'<span class="post-chip">👤 {fmt_int(ex["profile_visits"])} profile visits</span>'
 
-    return f """
+    return f"""
     <a href="{permalink}" target="_blank" rel="noopener" class="post-card">
       <div class="post-rank">#{rank}</div>
       <div class="post-media">{thumb_html}<span class="post-type-badge">{media_label}</span></div>
@@ -1006,6 +1006,26 @@ with tab_overview:
                                breakdown_txt or "as reported by Meta"))
     st.markdown(f'<div class="kpi-grid">{"".join(kpis)}</div>', unsafe_allow_html=True)
 
+    # --- The v1 metric cells: same numbers, same formulas, always visible ---
+    st.markdown('<div class="section-eyebrow">Engagement rates — the five metrics '
+                'your schema stores</div>', unsafe_allow_html=True)
+    v1_cells = "".join([
+        render_kpi("Engagement rate", f"{industry_er}%",
+                   "avg likes+comments ÷ followers — matches most third-party tools"),
+        render_kpi("ER by followers (cumulative)", f"{schema_metrics['er_by_followers_30d']}%",
+                   "all engagement in the window ÷ followers — scales with posting frequency"),
+        render_kpi("ER by reach (cumulative)", f"{schema_metrics['er_by_reach_30d']}%",
+                   "all engagement ÷ Meta's account reach total for the window"),
+        render_kpi("ER per post (mean)", f"{schema_metrics['er_per_post_30d']}%",
+                   "each post's engagement ÷ its own reach, then averaged"),
+        render_kpi("Avg likes / post", f"{schema_metrics['avg_likes_30d']}"),
+        render_kpi("Total reach (30d)", fmt_int(schema_metrics['total_reach_30d']),
+                   "Meta's window total (sum of daily values)"),
+    ])
+    st.markdown(f'<div class="kpi-grid">{v1_cells}</div>', unsafe_allow_html=True)
+    st.caption("Four different engagement-rate numbers on purpose — they answer different "
+               "questions and won't match each other or every other tool. See the labels.")
+
     # Signature element: the format split, from Meta's own account-level breakdown
     st.markdown('<div class="section-eyebrow">Reels vs Feed — Meta\'s account-level split</div>',
                 unsafe_allow_html=True)
@@ -1031,13 +1051,17 @@ with tab_overview:
     with c1:
         st.markdown('<div class="section-eyebrow">Daily reach</div>', unsafe_allow_html=True)
         ch = area_chart(reach_series, "reach")
-        st.altair_chart(ch, use_container_width=True) if ch is not None else st.info(
-            "No daily reach series returned.")
+        if ch is not None:
+            st.altair_chart(ch, use_container_width=True)
+        else:
+            st.info("No daily reach series returned.")
     with c2:
         st.markdown('<div class="section-eyebrow">New followers / day</div>', unsafe_allow_html=True)
         ch = bar_chart(follower_series, "date", None, "new followers")
-        st.altair_chart(ch, use_container_width=True) if ch is not None else st.info(
-            "follower_count series unavailable (requires ≥100 followers).")
+        if ch is not None:
+            st.altair_chart(ch, use_container_width=True)
+        else:
+            st.info("follower_count series unavailable (requires ≥100 followers).")
 
     st.markdown('<div class="section-eyebrow">Top posts, all formats</div>', unsafe_allow_html=True)
     top = rank_top_posts(posts)
@@ -1046,22 +1070,6 @@ with tab_overview:
                     unsafe_allow_html=True)
     else:
         st.info("No posts with insights in this window yet.")
-
-    with st.expander("All engagement-rate definitions (stored in your schema + comparison)"):
-        st.table(pd.DataFrame([
-            {"metric": "ER median per post", "value": f"{er_median_all}%",
-             "definition": "median of each post's interactions ÷ its own reach (robust headline)"},
-            {"metric": "er_per_post_30d (schema)", "value": f"{schema_metrics['er_per_post_30d']}%",
-             "definition": "mean of each post's interactions ÷ its own reach"},
-            {"metric": "er_by_followers_30d (schema)", "value": f"{schema_metrics['er_by_followers_30d']}%",
-             "definition": "all interactions in window ÷ followers — scales with posting frequency"},
-            {"metric": "er_by_reach_30d (schema)", "value": f"{schema_metrics['er_by_reach_30d']}%",
-             "definition": "all interactions ÷ Meta's account reach total for the window"},
-            {"metric": "Industry-style ER", "value": f"{industry_er}%",
-             "definition": "(avg likes + avg comments per post) ÷ followers — what most third-party tools display"},
-            {"metric": "avg_likes_30d (schema)", "value": f"{schema_metrics['avg_likes_30d']}",
-             "definition": "mean likes per post"},
-        ]))
 
 # --- REELS ------------------------------------------------------------------
 with tab_reels:
