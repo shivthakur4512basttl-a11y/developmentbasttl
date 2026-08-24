@@ -6,11 +6,12 @@ Facebook Login, no graph.facebook.com anywhere in this file, per your request).
 ENV VARS REQUIRED (set these in Streamlit Cloud -> App -> Settings -> Secrets,
 or in a local .env file for dev):
 
-    INSTA_APP_ID       Your Instagram app's Client ID
-    INSTA_APP_SECRET   Your Instagram app's Client Secret
-    BASE_URL           The exact base URL this app is deployed at, e.g.
-                        https://developmentflowinstagram.streamlit.app
-                        (no trailing slash)
+    INSTA_APP_ID        Your Instagram app's Client ID
+    INSTA_APP_SECRET    Your Instagram app's Client Secret
+    INSTA_REDIRECT_URI  The exact redirect URL, e.g.
+                         https://developmentflowinstagram.streamlit.app/callback
+                         Must match what's registered in the Meta App
+                         Dashboard character for character.
 
 Everything else is derived from those three. See README.md for the full
 Meta App Dashboard setup steps (redirect URI registration etc.) — code alone
@@ -33,12 +34,15 @@ load_dotenv()
 
 INSTA_APP_ID = os.getenv("INSTA_APP_ID")
 INSTA_APP_SECRET = os.getenv("INSTA_APP_SECRET")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
-# This MUST exactly match a "Valid OAuth Redirect URI" registered in your
-# Meta App Dashboard -> Instagram -> API setup with Instagram login, or the
-# authorization request will be rejected before your app ever sees it.
-REDIRECT_URI = f"{BASE_URL}/callback"
+# Set this to the FULL redirect URL, e.g.:
+#   https://developmentflowinstagram.streamlit.app/callback
+# It must exactly match a "Valid OAuth Redirect URI" registered in your Meta
+# App Dashboard -> Instagram -> API setup with Instagram login, character for
+# character, or the authorization request is rejected before your app code
+# ever runs. Kept as one env var (not built from a separate base-URL var) so
+# there's only one place this can drift out of sync with the dashboard.
+REDIRECT_URI = os.getenv("INSTA_REDIRECT_URI", "").strip()
 
 API_VERSION = "v25.0"  # bump this in one place when Meta ships a new version
 GRAPH_HOST = "https://graph.instagram.com"
@@ -297,7 +301,7 @@ st.title("📊 Instagram Business Insights")
 
 missing = [n for n, v in [("INSTA_APP_ID", INSTA_APP_ID),
                            ("INSTA_APP_SECRET", INSTA_APP_SECRET),
-                           ("BASE_URL", BASE_URL)] if not v]
+                           ("INSTA_REDIRECT_URI", REDIRECT_URI)] if not v]
 if missing:
     st.error(f"Missing required environment variable(s): {', '.join(missing)}. "
               f"Set them in Settings -> Secrets, then reload.")
