@@ -70,6 +70,17 @@ MEDIA_FIELDS = (
 WINDOW_DAYS = 30  # matches the _30d columns; change in one place if you add 7d/90d
 TOP_N_POSTS = 3   # how many "top performing" cards to show
 
+# Mirrors Instagram's own "Content insights" sort dropdown. "Accounts engaged"
+# is deliberately left out: Meta's own Media Insights reference doesn't expose
+# it at the per-post level via the public API (confirmed directly against
+# developers.facebook.com), only these four raw counts are available there.
+SORT_METRICS = {
+    "Interactions": "total_interactions",
+    "Shares": "shares",
+    "Viewers (reach)": "reach",
+    "Views": "views",
+}
+
 
 # ---------------------------------------------------------------------------
 # 2. OAUTH — Instagram Login flow (graph.instagram.com / api.instagram.com only)
@@ -274,10 +285,25 @@ def compute_industry_engagement_rate(posts: list[dict], followers_count: int) ->
     return round((avg_likes + avg_comments) / followers_count * 100, 2)
 
 
-def rank_top_posts(posts: list[dict], n: int = TOP_N_POSTS) -> list[dict]:
-    """Top N posts by total_interactions (likes+comments+saves+shares)."""
-    return sorted(posts, key=lambda p: _post_insight_value(p, "total_interactions"),
+def rank_top_posts(posts: list[dict], metric_key: str = "total_interactions",
+                    n: int = TOP_N_POSTS) -> list[dict]:
+    """Top N posts by the given insight metric name (see SORT_METRICS)."""
+    return sorted(posts, key=lambda p: _post_insight_value(p, metric_key),
                   reverse=True)[:n]
+
+
+def matches_content_type(post: dict, filter_name: str) -> bool:
+    if filter_name == "All":
+        return True
+    media_type = post.get("media_type")
+    product_type = post.get("media_product_type")
+    if filter_name == "Reels":
+        return product_type == "REELS"
+    if filter_name == "Carousels":
+        return media_type == "CAROUSEL_ALBUM"
+    if filter_name == "Posts":
+        return media_type in ("IMAGE", "VIDEO") and product_type != "REELS"
+    return True
 
 
 def _post_thumbnail(post: dict) -> str | None:
@@ -356,8 +382,11 @@ CARD_CSS = """
 .post-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
 .post-thumb-empty { width: 100%; height: 100%; display: flex; align-items: center;
                      justify-content: center; font-size: 40px; }
-.post-type-badge { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,.65);
+.post-type-badge { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,.65);
                     color: #fff; font-size: 11px; padding: 2px 9px; border-radius: 999px; }
+.post-count-badge { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+                     background: rgba(255,255,255,.94); color: #14151b; font-weight: 700;
+                     font-size: 13px; padding: 3px 13px; border-radius: 999px; }
 .post-body { padding: 12px 14px 14px; }
 .post-caption { font-size: 13px; color: #d7d8e0; line-height: 1.4; min-height: 36px; margin: 0 0 10px; }
 .post-stats { display: flex; gap: 12px; font-size: 12.5px; color: #b9bac6; margin-bottom: 8px; }
@@ -375,7 +404,8 @@ def render_metric_box(label: str, value: str, sub: str = "") -> str:
             f'<div class="value">{value}</div>{sub_html}</div>')
 
 
-def render_post_card(post: dict, rank: int) -> str:
+def render_post_card(post: dict, rank: int, badge_metric: str = "total_interactions",
+                      badge_label: str = "Interactions") -> str:
     thumb = _post_thumbnail(post)
     thumb_html = (f'<img src="{thumb}" class="post-thumb" />' if thumb
                   else '<div class="post-thumb post-thumb-empty">🎬</div>')
@@ -391,17 +421,22 @@ def render_post_card(post: dict, rank: int) -> str:
     comments = post.get("comments_count", 0)
     reach = _post_insight_value(post, "reach")
     interactions = _post_insight_value(post, "total_interactions")
+    badge_value = _post_insight_value(post, badge_metric)
     permalink = post.get("permalink", "#")
     date_str = (post.get("timestamp") or "")[:10]
 
     return f"""
     <a href="{permalink}" target="_blank" class="post-card">
       <div class="post-rank">#{rank}</div>
-      <div class="post-media">{thumb_html}<span class="post-type-badge">{media_label}</span></div>
+      <div class="post-media">
+        {thumb_html}
+        <span class="post-type-badge">{media_label}</span>
+        <span class="post-count-badge">{badge_value:,}</span>
+      </div>
       <div class="post-body">
         <p class="post-caption">{caption or '<em>No caption</em>'}</p>
         <div class="post-stats"><span>❤️ {likes:,}</span><span>💬 {comments:,}</span><span>👁️ {reach:,}</span></div>
-        <div class="post-footer"><span>{date_str}</span><span>{interactions:,} interactions</span></div>
+        <div class="post-footer"><span>{date_str}</span><span>{badge_value:,} {html.escape(badge_label.split(' ')[0].lower())}</span></div>
       </div>
     </a>
     """
@@ -514,13 +549,30 @@ st.caption("Four different “engagement rate” numbers on purpose — they ans
            "questions and won't match each other or every other tool. See the labels.")
 
 st.markdown("### 🏆 Top performing posts")
-top_posts = rank_top_posts(posts, TOP_N_POSTS)
+
+filt_col, sort_col = st.columns([1, 1])
+with filt_col:
+    type_filter = st.selectbox("Content type", ["All", "Reels", "Posts", "Carousels"])
+with sort_col:
+    sort_label = st.selectbox("Sort by", list(SORT_METRICS.keys()), index=0)
+
+filtered_posts = [p for p in posts if matches_content_type(p, type_filter)]
+top_posts = rank_top_posts(filtered_posts, SORT_METRICS[sort_label], TOP_N_POSTS)
+
 if top_posts:
-    cards_html = "".join(render_post_card(p, i + 1) for i, p in enumerate(top_posts))
+    cards_html = "".join(
+        render_post_card(p, i + 1, SORT_METRICS[sort_label], sort_label)
+        for i, p in enumerate(top_posts)
+    )
     st.markdown(f'<div class="post-grid">{cards_html}</div>', unsafe_allow_html=True)
-    st.caption("Ranked by total_interactions (likes + comments + saves + shares) in the window.")
 else:
-    st.info("No posts with insights data in this window yet.")
+    st.info("No posts match this filter in the current window.")
+
+st.caption(
+    "Sort options mirror Instagram's own Content insights panel. **Accounts engaged** "
+    "isn't included — Meta doesn't expose that metric per post through the public API, "
+    "only through the Instagram app itself. Interactions is the closest available proxy."
+)
 
 st.divider()
 st.markdown("### Rows shaped for your database")
