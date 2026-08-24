@@ -18,6 +18,7 @@ Meta App Dashboard setup steps (redirect URI registration etc.) — code alone
 will not work until that side is configured to match.
 """
 
+import html
 import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -61,11 +62,13 @@ SCOPES = [
 # media created after 2024-07-02 (error, not just empty data, on v22.0+).
 # `views` is already its replacement and is already in this list.
 MEDIA_FIELDS = (
-    "id,timestamp,permalink,like_count,comments_count,"
+    "id,timestamp,permalink,caption,media_type,media_product_type,"
+    "media_url,thumbnail_url,like_count,comments_count,"
     "insights.metric(views,reach,saved,shares,total_interactions)"
 )
 
 WINDOW_DAYS = 30  # matches the _30d columns; change in one place if you add 7d/90d
+TOP_N_POSTS = 3   # how many "top performing" cards to show
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +255,37 @@ def compute_metrics(posts: list[dict], followers_count: int, account_totals: dic
     }
 
 
+def compute_industry_engagement_rate(posts: list[dict], followers_count: int) -> float:
+    """(avg likes + avg comments PER POST) / followers x 100.
+
+    This is a different statistic from er_by_followers_30d above, on purpose.
+    er_by_followers_30d SUMS engagement across every post in the window, so it
+    scales with how often you post. This one AVERAGES per post first, which is
+    what Socialinsider, InstaTrack, and most third-party IG analytics tools
+    report as "Engagement Rate" -- confirmed by matching their displayed
+    numbers against this exact formula. Keep both: this one is what you
+    compare against other tools; er_by_followers_30d is what actually belongs
+    in your schema.
+    """
+    if not posts or not followers_count:
+        return 0.0
+    avg_likes = sum(p.get("like_count", 0) for p in posts) / len(posts)
+    avg_comments = sum(p.get("comments_count", 0) for p in posts) / len(posts)
+    return round((avg_likes + avg_comments) / followers_count * 100, 2)
+
+
+def rank_top_posts(posts: list[dict], n: int = TOP_N_POSTS) -> list[dict]:
+    """Top N posts by total_interactions (likes+comments+saves+shares)."""
+    return sorted(posts, key=lambda p: _post_insight_value(p, "total_interactions"),
+                  reverse=True)[:n]
+
+
+def _post_thumbnail(post: dict) -> str | None:
+    """Video/Reel posts expose a static preview via thumbnail_url; images
+    expose media_url directly. Fall back gracefully either way."""
+    return post.get("thumbnail_url") or post.get("media_url")
+
+
 # ---------------------------------------------------------------------------
 # 5. ROWS SHAPED FOR YOUR SCHEMA
 #    (No DB write here on purpose — you haven't told me what you're storing
@@ -293,10 +327,92 @@ def build_db_rows(identity, profile, token_meta, metrics) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 5b. PRESENTATION — CSS + card renderers
+# ---------------------------------------------------------------------------
+
+CARD_CSS = """
+<style>
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+               gap: 14px; margin: 10px 0 26px 0; }
+.metric-box { background: linear-gradient(155deg, #1a1c24 0%, #131319 100%);
+              border: 1px solid #2a2c36; border-radius: 14px; padding: 18px 20px; }
+.metric-box .label { font-size: 12px; color: #9a9cab; text-transform: uppercase;
+                      letter-spacing: .04em; margin-bottom: 8px; }
+.metric-box .value { font-size: 28px; font-weight: 700; line-height: 1.1;
+                      background: linear-gradient(90deg, #f58529, #dd2a7b, #8134af);
+                      -webkit-background-clip: text; background-clip: text; color: transparent; }
+.metric-box .sub { font-size: 11.5px; color: #6f7180; margin-top: 8px; line-height: 1.35; }
+
+.post-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+             gap: 16px; margin: 10px 0 26px 0; }
+.post-card { position: relative; display: block; background: #14151b;
+             border: 1px solid #2a2c36; border-radius: 16px; overflow: hidden;
+             text-decoration: none; transition: transform .15s ease, border-color .15s ease; }
+.post-card:hover { transform: translateY(-3px); border-color: #dd2a7b; }
+.post-rank { position: absolute; top: 10px; left: 10px; z-index: 2; color: #fff;
+             font-weight: 700; font-size: 12px; padding: 3px 10px; border-radius: 999px;
+             background: linear-gradient(90deg, #f58529, #dd2a7b, #8134af); }
+.post-media { position: relative; width: 100%; aspect-ratio: 4 / 5; background: #0e0f13; }
+.post-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.post-thumb-empty { width: 100%; height: 100%; display: flex; align-items: center;
+                     justify-content: center; font-size: 40px; }
+.post-type-badge { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,.65);
+                    color: #fff; font-size: 11px; padding: 2px 9px; border-radius: 999px; }
+.post-body { padding: 12px 14px 14px; }
+.post-caption { font-size: 13px; color: #d7d8e0; line-height: 1.4; min-height: 36px; margin: 0 0 10px; }
+.post-stats { display: flex; gap: 12px; font-size: 12.5px; color: #b9bac6; margin-bottom: 8px; }
+.post-footer { display: flex; justify-content: space-between; font-size: 11.5px;
+               color: #6f7180; border-top: 1px solid #23242d; padding-top: 8px; }
+</style>
+"""
+
+_MEDIA_LABELS = {"REELS": "Reel", "VIDEO": "Video", "CAROUSEL_ALBUM": "Carousel", "IMAGE": "Post"}
+
+
+def render_metric_box(label: str, value: str, sub: str = "") -> str:
+    sub_html = f'<div class="sub">{html.escape(sub)}</div>' if sub else ""
+    return (f'<div class="metric-box"><div class="label">{html.escape(label)}</div>'
+            f'<div class="value">{value}</div>{sub_html}</div>')
+
+
+def render_post_card(post: dict, rank: int) -> str:
+    thumb = _post_thumbnail(post)
+    thumb_html = (f'<img src="{thumb}" class="post-thumb" />' if thumb
+                  else '<div class="post-thumb post-thumb-empty">🎬</div>')
+
+    caption = html.escape((post.get("caption") or "").strip())
+    if len(caption) > 110:
+        caption = caption[:110].rsplit(" ", 1)[0] + "…"
+
+    media_label = _MEDIA_LABELS.get(
+        post.get("media_product_type") or post.get("media_type"), "Post"
+    )
+    likes = post.get("like_count", 0)
+    comments = post.get("comments_count", 0)
+    reach = _post_insight_value(post, "reach")
+    interactions = _post_insight_value(post, "total_interactions")
+    permalink = post.get("permalink", "#")
+    date_str = (post.get("timestamp") or "")[:10]
+
+    return f"""
+    <a href="{permalink}" target="_blank" class="post-card">
+      <div class="post-rank">#{rank}</div>
+      <div class="post-media">{thumb_html}<span class="post-type-badge">{media_label}</span></div>
+      <div class="post-body">
+        <p class="post-caption">{caption or '<em>No caption</em>'}</p>
+        <div class="post-stats"><span>❤️ {likes:,}</span><span>💬 {comments:,}</span><span>👁️ {reach:,}</span></div>
+        <div class="post-footer"><span>{date_str}</span><span>{interactions:,} interactions</span></div>
+      </div>
+    </a>
+    """
+
+
+# ---------------------------------------------------------------------------
 # 6. STREAMLIT UI
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="Instagram Business Insights", page_icon="📊", layout="wide")
+st.markdown(CARD_CSS, unsafe_allow_html=True)
 st.title("📊 Instagram Business Insights")
 
 missing = [n for n, v in [("INSTA_APP_ID", INSTA_APP_ID),
@@ -376,17 +492,35 @@ with col_info:
         f"**Posts:** {profile.get('media_count', 0):,}"
     )
 
+industry_er = compute_industry_engagement_rate(posts, profile.get("followers_count", 0))
+
 st.divider()
 st.markdown(f"### Last {WINDOW_DAYS} days — {metrics['post_count']} posts")
 
-c1, c2, c3 = st.columns(3)
-c1.metric("ER by followers", f"{metrics['er_by_followers_30d']}%")
-c2.metric("ER by reach", f"{metrics['er_by_reach_30d']}%")
-c3.metric("ER per post (mean)", f"{metrics['er_per_post_30d']}%")
+metric_boxes = "".join([
+    render_metric_box("Engagement rate", f"{industry_er}%",
+                       "avg likes+comments ÷ followers — matches Socialinsider / InstaTrack"),
+    render_metric_box("ER by followers (cumulative)", f"{metrics['er_by_followers_30d']}%",
+                       "all engagement in the window ÷ followers — scales with posting frequency"),
+    render_metric_box("ER by reach (cumulative)", f"{metrics['er_by_reach_30d']}%",
+                       "all engagement in the window ÷ true 30d reach"),
+    render_metric_box("ER per post (mean)", f"{metrics['er_per_post_30d']}%",
+                       "each post's own engagement ÷ its own reach, then averaged"),
+    render_metric_box("Avg likes / post", f"{metrics['avg_likes_30d']}"),
+    render_metric_box("Total reach (30d, deduped)", f"{metrics['total_reach_30d']:,}"),
+])
+st.markdown(f'<div class="metric-grid">{metric_boxes}</div>', unsafe_allow_html=True)
+st.caption("Four different “engagement rate” numbers on purpose — they answer different "
+           "questions and won't match each other or every other tool. See the labels.")
 
-c4, c5 = st.columns(2)
-c4.metric("Avg likes / post", metrics["avg_likes_30d"])
-c5.metric("Total reach (30d, deduped)", f"{metrics['total_reach_30d']:,}")
+st.markdown("### 🏆 Top performing posts")
+top_posts = rank_top_posts(posts, TOP_N_POSTS)
+if top_posts:
+    cards_html = "".join(render_post_card(p, i + 1) for i, p in enumerate(top_posts))
+    st.markdown(f'<div class="post-grid">{cards_html}</div>', unsafe_allow_html=True)
+    st.caption("Ranked by total_interactions (likes + comments + saves + shares) in the window.")
+else:
+    st.info("No posts with insights data in this window yet.")
 
 st.divider()
 st.markdown("### Rows shaped for your database")
