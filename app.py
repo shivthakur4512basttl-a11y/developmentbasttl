@@ -252,7 +252,7 @@ def compute_metrics(posts: list[dict], followers_count: int, account_totals: dic
         "avg_likes_30d": round(likes_sum / post_count, 2) if post_count else 0.0,
         "er_by_followers_30d": (
             round((interactions_sum / followers_count) * 100, 2) if followers_count else 0.0
-        ),
+        ), 
         "er_by_reach_30d": (
             round((interactions_sum / account_reach) * 100, 2) if account_reach else 0.0
         ),
