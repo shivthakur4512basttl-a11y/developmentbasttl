@@ -385,13 +385,24 @@ def _parse_total_value_payload(data: dict) -> dict:
     return out
 
 
-def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str],
-                                 days: int, context: str, **extra) -> dict:
-    """Meta 400s the WHOLE call if one metric is unavailable for this account
-    or was deprecated since this file was written. Drop the offending metric
-    (when the error message names it) and retry, up to 4 times."""
-    since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-    until = int(datetime.now(timezone.utc).timestamp())
+def _chunk_ranges(days: int, max_span: int = 30) -> list[tuple[int, int]]:
+    """Split the window into <=max_span-day (since, until) unix pairs — Meta
+    serves short insight ranges, so 90d becomes three 30d calls."""
+    now = datetime.now(timezone.utc)
+    cur = now - timedelta(days=days)
+    out = []
+    while cur < now:
+        nxt = min(cur + timedelta(days=max_span), now)
+        out.append((int(cur.timestamp()), int(nxt.timestamp())))
+        cur = nxt
+    return out
+
+
+def _totals_single(token: str, ig_user_id: str, metrics: list[str],
+                   since: int, until: int, context: str, **extra) -> dict:
+    """One since/until range. Meta 400s the WHOLE call if one metric is
+    unavailable for this account or was deprecated since this file was
+    written. Drop the offending metric (when the error names it) and retry."""
     remaining = list(metrics)
     for _ in range(4):
         if not remaining:
@@ -412,6 +423,23 @@ def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str]
             remaining.remove(m)
         _record_error(f"{context} (dropped: {', '.join(dropped)})", err)
     return {}
+
+
+def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str],
+                                 days: int, context: str, **extra) -> dict:
+    """Window totals, chunked into <=30d ranges and summed. Additive metrics
+    (views, likes, interactions…) sum exactly; reach sums each chunk's value,
+    consistent with the sum-of-daily-values caveat used everywhere else."""
+    merged: dict = {}
+    for since, until in _chunk_ranges(days):
+        part = _totals_single(token, ig_user_id, metrics, since, until,
+                              context, **extra)
+        for name, entry in part.items():
+            slot = merged.setdefault(name, {"total": 0, "by": {}})
+            slot["total"] += entry.get("total", 0)
+            for k, v in (entry.get("by") or {}).items():
+                slot["by"][k] = slot["by"].get(k, 0) + v
+    return merged
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -447,51 +475,68 @@ def fetch_follows_unfollows(token: str, ig_user_id: str, days: int) -> dict:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_timeseries(token: str, ig_user_id: str, metric: str, days: int) -> list[dict]:
-    """Daily time series -> [{"date": ..., "value": ...}]. Used for reach and
-    follower_count (the latter needs >=100 followers; empty otherwise)."""
-    since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-    until = int(datetime.now(timezone.utc).timestamp())
-    data, err = api_get(
-        f"{ig_user_id}/insights", token,
-        metric=metric, period="day", metric_type="time_series",
-        since=since, until=until,
-    )
-    if err:
-        _record_error(f"time series {metric}", err)
-        return []
-    out = []
-    for m in data.get("data", []):
-        if m.get("name") != metric:
-            continue
-        for v in m.get("values", []):
-            end = (v.get("end_time") or "")[:10]
-            out.append({"date": end, "value": v.get("value", 0)})
+def fetch_follower_split(token: str, ig_user_id: str, days: int) -> dict:
+    """Followers vs non-followers split for views / reach / interactions —
+    what Instagram's native 'Account insights' shows as 30.3% / 69.7%.
+    Meta's docs name this breakdown inconsistently (follower_type for views,
+    follow_type for reach), so both spellings are tried per metric; metrics
+    that reject both are simply absent from the result."""
+    out: dict = {}
+    for metric in ("views", "reach", "total_interactions"):
+        for bd in ("follower_type", "follow_type"):
+            res = _totals_with_metric_dropping(
+                token, ig_user_id, [metric], days,
+                f"{metric} follower split ({bd})", breakdown=bd)
+            if (res.get(metric) or {}).get("by"):
+                out[metric] = res[metric]
+                break
     return out
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_online_followers(token: str, ig_user_id: str) -> dict[int, float]:
-    """Hour-of-day -> mean follower-online count over the last 30 days (UTC).
-    Requires >=100 followers. Returns {} when unavailable."""
+def fetch_timeseries(token: str, ig_user_id: str, metric: str, days: int) -> list[dict]:
+    """Daily time series -> [{"date": ..., "value": ...}], chunked into <=30d
+    calls for longer windows. follower_count needs >=100 followers and Meta
+    serves only ~30 days of it — older chunks fail quietly into the log."""
+    out: list[dict] = []
+    for since, until in _chunk_ranges(days):
+        data, err = api_get(
+            f"{ig_user_id}/insights", token,
+            metric=metric, period="day", metric_type="time_series",
+            since=since, until=until,
+        )
+        if err:
+            _record_error(f"time series {metric}", err)
+            continue
+        for m in data.get("data", []):
+            if m.get("name") != metric:
+                continue
+            for v in m.get("values", []):
+                end = (v.get("end_time") or "")[:10]
+                out.append({"date": end, "value": v.get("value", 0)})
+    dedup = {row["date"]: row for row in out}
+    return [dedup[d] for d in sorted(dedup)]
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_online_followers_raw(token: str, ig_user_id: str) -> list[tuple[str, dict]]:
+    """Per-day hour buckets for the last ~30 days (Meta's limit) ->
+    [(YYYY-MM-DD, {hour_str: count})]. Requires >=100 followers.
+    Kept per-day so the UI can filter by weekday like the native app."""
     data, err = api_get(
         f"{ig_user_id}/insights", token,
         metric="online_followers", period="lifetime",
     )
     if err:
         _record_error("online followers", err)
-        return {}
-    buckets: dict[int, list[float]] = {}
+        return []
+    out = []
     for m in data.get("data", []):
         for v in m.get("values", []):
             val = v.get("value")
             if isinstance(val, dict):
-                for hour, count in val.items():
-                    try:
-                        buckets.setdefault(int(hour), []).append(float(count))
-                    except (TypeError, ValueError):
-                        continue
-    return {h: sum(vs) / len(vs) for h, vs in buckets.items() if vs}
+                out.append(((v.get("end_time") or "")[:10], val))
+    return out
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -771,6 +816,20 @@ h1, h2, h3, .display { font-family: 'Space Grotesk', 'Inter', sans-serif; letter
 .split .row b { color: var(--t1); font-weight: 600; }
 @media (max-width: 700px) { .split { grid-template-columns: 1fr; } }
 
+.pct-block { background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px 18px; margin: 8px 0 14px; }
+.pct-block h4 { margin: 0 0 10px; font-family: 'Space Grotesk', sans-serif;
+  font-size: 14px; color: var(--t1); }
+.pct-row { display: flex; align-items: center; gap: 12px; padding: 5px 0; }
+.pct-label { flex: 0 0 64px; font-size: 12.5px; color: var(--t2); }
+.pct-track { flex: 1; height: 8px; background: var(--panel-2);
+  border-radius: 999px; overflow: hidden; }
+.pct-fill { display: block; height: 100%; border-radius: 999px;
+  background: var(--grad); }
+.pct-val { flex: 0 0 52px; text-align: right; font-size: 12.5px;
+  color: var(--t1); font-weight: 600; }
+.pct-sub { font-size: 11px; color: var(--t3); margin-top: 8px; }
+
 .post-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
   gap: 14px; margin: 8px 0 22px; }
 .post-card { position: relative; display: block; background: var(--panel);
@@ -800,6 +859,44 @@ h1, h2, h3, .display { font-family: 'Space Grotesk', 'Inter', sans-serif; letter
 """
 
 _MEDIA_LABELS = {"REELS": "Reel", "VIDEO": "Video", "CAROUSEL_ALBUM": "Carousel", "IMAGE": "Post"}
+
+
+_FORMAT_LABELS = {"REELS": "Reels", "FEED": "Posts", "STORY": "Stories", "AD": "Ads"}
+
+
+def render_pct_block(title: str, by: dict, sub: str = "") -> str:
+    """Native-style 'By content type' percentage bars from a breakdown map."""
+    total = sum(v for v in by.values() if v)
+    if not total:
+        return ""
+    rows = []
+    order = ["REELS", "FEED", "STORY", "AD"] + [k for k in by if k not in _FORMAT_LABELS]
+    for key in order:
+        v = by.get(key)
+        if not v:
+            continue
+        pct = v / total * 100
+        rows.append(
+            f'<div class="pct-row">'
+            f'<span class="pct-label">{html.escape(_FORMAT_LABELS.get(key, key.title()))}</span>'
+            f'<span class="pct-track"><span class="pct-fill" style="width:{pct:.1f}%"></span></span>'
+            f'<span class="pct-val">{pct:.1f}%</span></div>')
+    sub_html = f'<div class="pct-sub">{html.escape(sub)}</div>' if sub else ""
+    return (f'<div class="pct-block"><h4>{html.escape(title)}</h4>'
+            f'{"".join(rows)}{sub_html}</div>')
+
+
+def follower_split_line(metric_label: str, entry: dict) -> str | None:
+    """'Views — Followers 30.3% · Non-followers 69.7%' from a follower-type
+    breakdown. Labels come straight from Meta; nothing is renamed."""
+    by = (entry or {}).get("by") or {}
+    total = sum(v for v in by.values() if v)
+    if not total:
+        return None
+    parts = " · ".join(
+        f"{k.replace('_', '-').title()} {v / total * 100:.1f}%"
+        for k, v in sorted(by.items(), key=lambda kv: -kv[1]))
+    return f"{metric_label} — {parts}"
 
 
 def render_kpi(label: str, value: str, sub: str = "", hero: bool = False) -> str:
@@ -929,8 +1026,8 @@ if "access_token" not in st.session_state:
 
     if not code:
         st.session_state.oauth_state = pysecrets.token_urlsafe(16)
-        st.info("Connect an Instagram professional account to see its "
-                f"{WINDOW_DAYS}-day insights — account totals, Reels and Feed "
+        st.info("Connect an Instagram professional account to see its insights — "
+                "7 / 30 / 90-day windows, account totals, Reels and Feed "
                 "separated, audience data, and best posting hours.")
         st.link_button("Log in with Instagram",
                        build_authorize_url(st.session_state.oauth_state),
@@ -976,6 +1073,16 @@ token = st.session_state.access_token
 token_meta = st.session_state.token_meta
 st.session_state.setdefault("api_errors", [])
 
+# --- Window selector: 7 / 30 / 90 days --------------------------------------
+_window_opts = [7, 30, 90]
+if hasattr(st, "segmented_control"):
+    _picked = st.segmented_control("Insights window (days)", _window_opts,
+                                   default=WINDOW_DAYS)
+else:  # older Streamlit fallback
+    _picked = st.radio("Insights window (days)", _window_opts,
+                       index=_window_opts.index(WINDOW_DAYS), horizontal=True)
+window_days = _picked or WINDOW_DAYS
+
 with st.spinner("Loading profile and account insights…"):
     identity = fetch_identity(token)
     ig_user_id = identity.get("user_id") or identity.get("id")
@@ -988,12 +1095,13 @@ with st.spinner("Loading profile and account insights…"):
         st.stop()
     profile = fetch_profile(token, ig_user_id)
     followers = profile.get("followers_count", 0) or 0
-    posts = fetch_media_window(token, ig_user_id, WINDOW_DAYS)
-    fmt_totals = fetch_account_totals_by_format(token, ig_user_id, WINDOW_DAYS)
-    plain_totals = fetch_account_totals_plain(token, ig_user_id, WINDOW_DAYS)
-    fu_totals = fetch_follows_unfollows(token, ig_user_id, WINDOW_DAYS)
-    reach_series = fetch_timeseries(token, ig_user_id, "reach", WINDOW_DAYS)
-    follower_series = fetch_timeseries(token, ig_user_id, "follower_count", WINDOW_DAYS)
+    posts = fetch_media_window(token, ig_user_id, window_days)
+    fmt_totals = fetch_account_totals_by_format(token, ig_user_id, window_days)
+    plain_totals = fetch_account_totals_plain(token, ig_user_id, window_days)
+    fu_totals = fetch_follows_unfollows(token, ig_user_id, window_days)
+    split_totals = fetch_follower_split(token, ig_user_id, window_days)
+    reach_series = fetch_timeseries(token, ig_user_id, "reach", window_days)
+    follower_series = fetch_timeseries(token, ig_user_id, "follower_count", window_days)
 
 # Per-media type-specific insights (watch time, skip rate, follows, visits)
 extras: dict[str, dict] = {}
@@ -1005,6 +1113,10 @@ if enrich:
             token, p["id"], p.get("media_product_type") or "")
         prog.progress((i + 1) / len(enrich))
     prog.empty()
+if len(posts) > MAX_ENRICHED_MEDIA:
+    st.caption(f"Watch-time / follows details loaded for the {MAX_ENRICHED_MEDIA} "
+               f"newest of {len(posts)} posts to keep load time sane; core metrics "
+               f"cover all posts.")
 
 reels, feed = split_by_format(posts)
 reels_stats = group_stats(reels, followers, extras)
@@ -1046,7 +1158,7 @@ with col_actions:
         st.session_state.clear()
         st.rerun()
 
-st.markdown(f'<div class="section-eyebrow">Last {WINDOW_DAYS} days · '
+st.markdown(f'<div class="section-eyebrow">Last {window_days} days · '
             f'{len(posts)} posts ({len(reels)} reels, {len(feed)} feed)</div>',
             unsafe_allow_html=True)
 
@@ -1069,17 +1181,6 @@ tab_overview, tab_reels, tab_feed, tab_audience, tab_data = st.tabs(
 
 # --- OVERVIEW ---------------------------------------------------------------
 with tab_overview:
-    if not posts:
-        media_errs = [e for e in st.session_state.get("api_errors", [])
-                      if str(e.get("context", "")).startswith("media")]
-        if media_errs:
-            st.warning(f"No posts loaded for the last {WINDOW_DAYS} days — the media "
-                       f"request reported a problem. Details: Data tab → API warnings. "
-                       f"Post-derived metrics below will read 0 until this resolves.")
-        else:
-            st.info(f"No posts published in the last {WINDOW_DAYS} days, so every "
-                    f"post-derived metric below is 0 by definition. Account-level cards "
-                    f"(views, reach, engaged) still count activity on older posts and stories.")
     fu_by = (fu_totals.get("follows_and_unfollows") or {}).get("by", {})
     fu_total = total_of("follows_and_unfollows", fu_totals)
     new_follows_gross = sum(r["value"] for r in follower_series) if follower_series else None
@@ -1130,12 +1231,41 @@ with tab_overview:
         render_kpi("ER per post (mean)", f"{schema_metrics['er_per_post_30d']}%",
                    "each post's engagement ÷ its own reach, then averaged"),
         render_kpi("Avg likes / post", f"{schema_metrics['avg_likes_30d']}"),
-        render_kpi("Total reach (30d)", fmt_int(schema_metrics['total_reach_30d']),
+        render_kpi(f"Total reach ({window_days}d)", fmt_int(schema_metrics['total_reach_30d']),
                    "Meta's window total (sum of daily values)"),
     ])
     st.markdown(f'<div class="kpi-grid">{v1_cells}</div>', unsafe_allow_html=True)
     st.caption("Four different engagement-rate numbers on purpose — they answer different "
-               "questions and won't match each other or every other tool. See the labels.")
+               "questions and won't match each other or every other tool. See the labels."
+               + ("" if window_days == 30 else
+                  f" Note: computed over your selected {window_days}-day window even "
+                  f"though the schema columns are named _30d."))
+
+    # --- Native-style content-type split (matches the in-app Account insights) ---
+    st.markdown('<div class="section-eyebrow">By content type — like the native '
+                'Account insights</div>', unsafe_allow_html=True)
+    _views_by = (fmt_totals.get("views") or {}).get("by", {})
+    _inter_by = (fmt_totals.get("total_interactions") or {}).get("by", {})
+    _bars = (render_pct_block("Views by content type", _views_by,
+                              "Stories appear here from the account-level breakdown; "
+                              "story-by-story history isn't retrievable (API keeps "
+                              "stories only while live, 24h).")
+             + render_pct_block("Interactions by content type", _inter_by))
+    if _bars:
+        st.markdown(_bars, unsafe_allow_html=True)
+    else:
+        st.info("Meta returned no content-type breakdown for this window.")
+
+    _split_lines = [ln for ln in (
+        follower_split_line("Views", split_totals.get("views")),
+        follower_split_line("Viewers (reach)", split_totals.get("reach")),
+        follower_split_line("Interactions", split_totals.get("total_interactions")),
+    ) if ln]
+    if _split_lines:
+        st.caption("Followers vs non-followers · " + "   |   ".join(_split_lines))
+    else:
+        st.caption("Followers vs non-followers split: not returned by Meta for this "
+                   "account/window — details in Data → API warnings.")
 
     # Signature element: the format split, from Meta's own account-level breakdown
     st.markdown('<div class="section-eyebrow">Reels vs Feed — Meta\'s account-level split</div>',
@@ -1174,11 +1304,50 @@ with tab_overview:
         else:
             st.info("follower_count series unavailable (requires ≥100 followers).")
 
-    st.markdown('<div class="section-eyebrow">Top posts, all formats</div>', unsafe_allow_html=True)
-    top = rank_top_posts(posts)
-    if top:
-        st.markdown(f'<div class="post-grid">{"".join(render_post_card(p, i + 1, extras) for i, p in enumerate(top))}</div>',
-                    unsafe_allow_html=True)
+    st.markdown('<div class="section-eyebrow">Top content</div>', unsafe_allow_html=True)
+    if posts:
+        _metric_opts = {
+            "Views": ("ins", "views"),
+            "Viewers (reach)": ("ins", "reach"),
+            "Post interactions": ("ins", "total_interactions"),
+            "Likes": ("field", "like_count"),
+            "Comments": ("field", "comments_count"),
+            "Saves": ("ins", "saved"),
+            "Shares": ("ins", "shares"),
+            "Follows (feed only)": ("extra", "follows"),
+            "Profile visits (feed only)": ("extra", "profile_visits"),
+        }
+        tc1, tc2, tc3, tc4 = st.columns([2, 1, 1, 1])
+        sel_metric = tc1.selectbox("Rank by", list(_metric_opts), key="top_metric")
+        sel_order = tc2.selectbox("Order", ["Highest", "Lowest", "Newest"], key="top_order")
+        sel_type = tc3.selectbox("Type", ["All", "Reels", "Posts"], key="top_type")
+        sel_n = tc4.selectbox("Show", [3, 5, 10, "All"], index=0, key="top_n")
+
+        pool = {"All": posts, "Reels": reels, "Posts": feed}[sel_type]
+
+        def _rank_value(p: dict) -> float:
+            kind, key = _metric_opts[sel_metric]
+            if kind == "ins":
+                return _post_insight_value(p, key)
+            if kind == "field":
+                return p.get(key, 0) or 0
+            return extras.get(p.get("id", ""), {}).get(key, 0) or 0
+
+        if sel_order == "Newest":
+            ranked = sorted(pool, key=lambda p: p.get("timestamp", ""), reverse=True)
+        else:
+            ranked = sorted(pool, key=_rank_value, reverse=(sel_order == "Highest"))
+        if sel_n != "All":
+            ranked = ranked[:int(sel_n)]
+
+        if ranked:
+            st.markdown(f'<div class="post-grid">{"".join(render_post_card(p, i + 1, extras) for i, p in enumerate(ranked))}</div>',
+                        unsafe_allow_html=True)
+        else:
+            st.info("Nothing matches this filter in the window.")
+        st.caption("Impressions isn't offered — Meta removed it from the API even "
+                   "though the native app still shows it. Follows and profile visits "
+                   "exist only on feed posts, so reels rank at 0 on those.")
     else:
         st.info("No posts with insights in this window yet.")
 
@@ -1293,16 +1462,61 @@ with tab_feed:
 
 # --- AUDIENCE ---------------------------------------------------------------
 with tab_audience:
-    st.markdown('<div class="section-eyebrow">When your followers are online (UTC)</div>',
-                unsafe_allow_html=True)
-    online = fetch_online_followers(token, ig_user_id)
-    if online:
-        ch = bar_chart([{"hour": f"{h:02d}", "value": round(v, 1)}
-                        for h, v in sorted(online.items())],
-                       "hour", "hour of day (UTC)", "avg followers online")
-        st.altair_chart(ch, use_container_width=True)
-        st.caption("Mean of the last 30 days, as reported by Meta. Hours are UTC — "
-                   "shift to your audience's timezone before scheduling.")
+    st.markdown('<div class="section-eyebrow">Most active times — when your '
+                'followers are online</div>', unsafe_allow_html=True)
+    online_raw = fetch_online_followers_raw(token, ig_user_id)
+    if online_raw:
+        _day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        ac1, ac2 = st.columns([3, 1])
+        with ac1:
+            if hasattr(st, "segmented_control"):
+                day_pick = st.segmented_control("Day", ["All"] + _day_names,
+                                                default="All", key="online_day")
+            else:
+                day_pick = st.radio("Day", ["All"] + _day_names, index=0,
+                                    horizontal=True, key="online_day")
+            day_pick = day_pick or "All"
+        with ac2:
+            tz_shift = st.number_input("Shift vs UTC (h)", value=0.0, step=0.5,
+                                       min_value=-12.0, max_value=14.0,
+                                       help="Meta reports hours in UTC. IST = 5.5",
+                                       key="online_tz")
+
+        _buckets: dict[int, list[float]] = {}
+        for date_str, hour_map in online_raw:
+            try:
+                wd = datetime.strptime(date_str, "%Y-%m-%d").weekday()
+            except ValueError:
+                continue
+            if day_pick != "All" and _day_names[wd] != day_pick:
+                continue
+            for h, c in hour_map.items():
+                try:
+                    _buckets.setdefault(int(h), []).append(float(c))
+                except (TypeError, ValueError):
+                    continue
+
+        if _buckets:
+            _rows, _order = [], []
+            for h in range(24):
+                vs = _buckets.get(h)
+                if not vs:
+                    continue
+                local = (h + tz_shift) % 24
+                label = f"{int(local):02d}:{'30' if local % 1 else '00'}"
+                _rows.append({"sort": local, "hour": label,
+                              "value": round(sum(vs) / len(vs), 1)})
+            _rows.sort(key=lambda r: r["sort"])
+            _order = [r["hour"] for r in _rows]
+            ch = bar_chart([{"hour": r["hour"], "value": r["value"]} for r in _rows],
+                           "hour", "hour of day", "avg followers online", sort=_order)
+            if ch is not None:
+                st.altair_chart(ch, use_container_width=True)
+            st.caption("Mean per hour over Meta's served window (~last 30 days, "
+                       "regardless of the insights window above). Pick a day to "
+                       "mirror the native app's M–Su view.")
+        else:
+            st.info("No online data for that day yet.")
     else:
         st.info("online_followers unavailable — Meta requires ≥100 followers and "
                 "only serves the last 30 days.")
