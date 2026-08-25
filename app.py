@@ -861,6 +861,13 @@ h1, h2, h3, .display { font-family: 'Space Grotesk', 'Inter', sans-serif; letter
 _MEDIA_LABELS = {"REELS": "Reel", "VIDEO": "Video", "CAROUSEL_ALBUM": "Carousel", "IMAGE": "Post"}
 
 
+def _compact_html(s: str) -> str:
+    """Markdown ends an HTML block at a blank line and renders 4-space-indented
+    text as a code block — so multi-line HTML with indentation leaks raw source
+    into the page from the second element onward. Collapse to one line."""
+    return "".join(line.strip() for line in s.splitlines() if line.strip())
+
+
 _FORMAT_LABELS = {"REELS": "Reels", "FEED": "Posts", "STORY": "Stories", "AD": "Ads"}
 
 
@@ -939,7 +946,7 @@ def render_post_card(post: dict, rank: int, extras: dict) -> str:
     if ex.get("profile_visits"):
         chips += f'<span class="post-chip">👤 {fmt_int(ex["profile_visits"])} profile visits</span>'
 
-    return f"""
+    return _compact_html(f"""
     <a href="{permalink}" target="_blank" rel="noopener" class="post-card">
       <div class="post-rank">#{rank}</div>
       <div class="post-media">{thumb_html}<span class="post-type-badge">{media_label}</span></div>
@@ -951,7 +958,7 @@ def render_post_card(post: dict, rank: int, extras: dict) -> str:
         <div class="post-footer"><span>{date_str}</span><span>{fmt_int(interactions)} interactions</span></div>
       </div>
     </a>
-    """
+    """)
 
 
 def _chart_base(df: pd.DataFrame):
@@ -1280,10 +1287,10 @@ with tab_overview:
         rows_l.append(l)
         rows_r.append(r)
     st.markdown(
-        f'''<div class="split">
+        _compact_html(f'''<div class="split">
               <div class="col"><h4>Reels<span class="tag">{len(reels)} posted</span></h4>{''.join(rows_l)}</div>
               <div class="col"><h4>Feed<span class="tag">{len(feed)} posted</span></h4>{''.join(rows_r)}</div>
-            </div>''',
+            </div>'''),
         unsafe_allow_html=True)
     st.caption("Source: account insights with breakdown=media_product_type — includes STORY/AD "
                "surfaces in the totals above, so the two columns won't sum to the account total.")
