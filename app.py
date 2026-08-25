@@ -1,7 +1,30 @@
 """
-Instagram Business Insights — Streamlit app (v3)
+Instagram Business Insights — Streamlit app (v4)
 Instagram API with Instagram Login only (graph.instagram.com / api.instagram.com).
 No Facebook Login, no graph.facebook.com anywhere in this file.
+
+WHAT CHANGED vs v3 — window convention is now selectable, nothing removed
+--------------------------------------------------------------------------
+1. The day-boundary convention and its timezone are now UI controls (an
+   expander under the 7/30/90 selector): "Day-aligned incl. today" (the v3
+   behavior, still the default), "Last N complete days (excl. today)", or
+   "Rolling — exact now − N days" (the v2 behavior), plus an hours-vs-UTC
+   offset for where midnight falls (IST = 5.5). Every account-level
+   total_value call, both time series, AND the posts-in-window cutoff follow
+   the same convention, and the settings are part of every cache key, so
+   switching modes can't serve stale numbers.
+   WHY: v3's UTC day-flooring narrowed the reach gap vs the native app
+   (77 low -> 52 low) but pushed views ~51 HIGH — views is additive, so a
+   wider window reads strictly higher. That result is evidence the app's
+   own "Last 30 days" is narrower and/or aligned to a different midnight
+   (likely the account's local timezone). Meta doesn't document the app's
+   convention, so it's now empirically testable instead of guessed.
+2. The cross-check caption now includes the views total with a note that
+   views moves ~linearly with window width; the Data-tab window-debug JSON
+   now records the active mode, offset, and views total alongside reach.
+3. In "complete days" mode, posts published today are also excluded from
+   the post-based metrics (consistent window everywhere); in the other two
+   modes post handling is byte-identical to before.
 
 WHAT CHANGED vs v2 — nothing removed, all additive/corrective
 ---------------------------------------------------------------
@@ -337,9 +360,15 @@ def _parse_ig_timestamp(raw: str) -> datetime | None:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_media_window(token: str, ig_user_id: str, days: int) -> list[dict]:
-    """All media published in the last `days` days, with the common insight
-    set attached.
+def fetch_media_window(token: str, ig_user_id: str, days: int,
+                       align: str = "day_floor", tz_h: float = 0.0) -> list[dict]:
+    """All media published inside the selected window, with the common
+    insight set attached. The window bounds come from _chunk_ranges() with
+    the SAME align/tz convention as the account totals, so "posts in
+    window" and "account totals window" can't silently diverge. The upper
+    bound only bites in complete-days mode (today's posts drop out along
+    with today's totals); in day-aligned and rolling modes it equals "now",
+    which changes nothing versus before.
 
     Resilience: if the insights field expansion makes the whole /media call
     fail (Meta rejects the entire request when one expanded metric is
@@ -348,9 +377,12 @@ def fetch_media_window(token: str, ig_user_id: str, days: int) -> list[dict]:
 
     Ordering: does NOT assume strict newest-first (pinned posts could break
     that). Items are filtered by timestamp; pagination stops only when an
-    entire page falls outside the window. If items came back but none landed
-    in the window, a diagnostic is recorded instead of a silent zero."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    entire page falls entirely OLDER than the window. If items came back but
+    none landed in the window, a diagnostic is recorded instead of a silent
+    zero."""
+    _ranges = _chunk_ranges(days, align=align, tz_h=tz_h)
+    cutoff = datetime.fromtimestamp(_ranges[0][0], tz=timezone.utc)
+    upper = datetime.fromtimestamp(_ranges[-1][1], tz=timezone.utc)
     posts: list[dict] = []
     expansion_ok = True
     data, err = api_get(f"{ig_user_id}/media", token, fields=MEDIA_FIELDS, limit=50)
@@ -373,8 +405,9 @@ def fetch_media_window(token: str, ig_user_id: str, days: int) -> list[dict]:
                 skipped_parse += 1
                 continue
             if ts >= cutoff:
-                posts.append(post)
-                page_has_recent = True
+                page_has_recent = True  # not yet older than the window
+                if ts < upper:
+                    posts.append(post)
         if page and not page_has_recent:
             break  # whole page older than the window — done
         next_url = data.get("paging", {}).get("next")
@@ -468,44 +501,67 @@ def _parse_total_value_payload(data: dict) -> dict:
     return out
 
 
-def _chunk_ranges(days: int, max_span: int = 30) -> list[tuple[int, int]]:
+# Window alignment modes. Meta doesn't document which convention the native
+# app's "Last N days" uses, so it's selectable and testable:
+#   day_floor      — since floored to local midnight of (now − N days),
+#                    until = this exact instant. v3 behavior at tz 0.
+#   complete_days  — last N complete local days: [midnight − N days, midnight
+#                    today]. Today's still-accumulating data excluded.
+#   rolling        — exact now − N days to now, to the second. v2 behavior.
+WINDOW_ALIGN_MODES = {
+    "Day-aligned days, incl. today (default)": "day_floor",
+    "Last N complete days (excl. today)": "complete_days",
+    "Rolling — exact now − N days": "rolling",
+}
+
+
+def _chunk_ranges(days: int, max_span: int = 30, align: str = "day_floor",
+                  tz_h: float = 0.0) -> list[tuple[int, int]]:
     """Split the window into <=max_span-day (since, until) unix pairs — Meta
     serves short insight ranges, so 90d becomes three 30d calls.
 
-    `since` is floored to 00:00 UTC of its day rather than left at the exact
-    instant the code happened to run. Reach and the other interaction
-    metrics are aggregated by whole days server-side; an unaligned `since`
-    risks Meta rounding away part of that first day, silently narrowing the
-    window versus a calendar-day "last N days" — which is very likely how
-    Instagram's own app computes its window. Flooring costs at most ~24h of
-    EXTRA data at the start rather than risking losing it. `until` is left
-    as the exact current moment, unchanged, so "today so far" is still
-    included exactly as before — only the lower boundary moved.
-
-    This narrows one candidate cause of API-vs-app mismatches; it is not a
-    guaranteed exact match, since Meta doesn't publicly document the app's
-    own day-inclusion/timezone convention. Use window_bounds_label() to see
-    the exact range this produces and compare it against the app."""
-    now = datetime.now(timezone.utc)
-    cur = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    `align` and `tz_h` pick the window convention (see WINDOW_ALIGN_MODES).
+    Rationale: reach/views/interactions are aggregated by whole days
+    server-side, and additive metrics move almost linearly with window
+    width — so WHERE the boundary falls, and in WHICH timezone, is exactly
+    what decides whether these totals line up with the native app's
+    "Last N days". Meta doesn't publish the app's convention; use the UI
+    expander + window_bounds_label() to find the one that matches instead
+    of trusting any single guess. Unix timestamps are timezone-correct
+    regardless of tz_h (aware datetimes)."""
+    tz = timezone(timedelta(hours=tz_h))
+    now = datetime.now(tz)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if align == "rolling":
+        lower, upper = now - timedelta(days=days), now
+    elif align == "complete_days":
+        lower, upper = midnight - timedelta(days=days), midnight
+    else:  # "day_floor"
+        lower = (now - timedelta(days=days)).replace(hour=0, minute=0,
+                                                     second=0, microsecond=0)
+        upper = now
     out = []
-    while cur < now:
-        nxt = min(cur + timedelta(days=max_span), now)
+    cur = lower
+    while cur < upper:
+        nxt = min(cur + timedelta(days=max_span), upper)
         out.append((int(cur.timestamp()), int(nxt.timestamp())))
         cur = nxt
     return out
 
 
-def window_bounds_label(days: int) -> str:
-    """Human-readable (since, until) for the full window, in UTC — for
-    comparing against whatever date range Instagram's app shows for the
-    same nominal 'last N days' period."""
-    ranges = _chunk_ranges(days)
+def window_bounds_label(days: int, align: str = "day_floor",
+                        tz_h: float = 0.0) -> str:
+    """Human-readable (since, until) for the full window, rendered in the
+    chosen boundary timezone — for comparing against whatever date range
+    Instagram's app shows for the same nominal 'last N days' period."""
+    ranges = _chunk_ranges(days, align=align, tz_h=tz_h)
     if not ranges:
         return "—"
-    since_dt = datetime.fromtimestamp(ranges[0][0], tz=timezone.utc)
-    until_dt = datetime.fromtimestamp(ranges[-1][1], tz=timezone.utc)
-    return f"{since_dt:%Y-%m-%d %H:%M} \u2192 {until_dt:%Y-%m-%d %H:%M} UTC"
+    tz = timezone(timedelta(hours=tz_h))
+    since_dt = datetime.fromtimestamp(ranges[0][0], tz=tz)
+    until_dt = datetime.fromtimestamp(ranges[-1][1], tz=tz)
+    off = f"UTC{tz_h:+g}" if tz_h else "UTC"
+    return f"{since_dt:%Y-%m-%d %H:%M} \u2192 {until_dt:%Y-%m-%d %H:%M} {off}"
 
 
 def _totals_single(token: str, ig_user_id: str, metrics: list[str],
@@ -536,12 +592,16 @@ def _totals_single(token: str, ig_user_id: str, metrics: list[str],
 
 
 def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str],
-                                 days: int, context: str, **extra) -> dict:
+                                 days: int, context: str, *,
+                                 align: str = "day_floor", tz_h: float = 0.0,
+                                 **extra) -> dict:
     """Window totals, chunked into <=30d ranges and summed. Additive metrics
     (views, likes, interactions…) sum exactly; reach sums each chunk's value,
-    consistent with the sum-of-daily-values caveat used everywhere else."""
+    consistent with the sum-of-daily-values caveat used everywhere else.
+    align/tz_h are keyword-only so they can never fall into **extra and leak
+    into the API query string."""
     merged: dict = {}
-    for since, until in _chunk_ranges(days):
+    for since, until in _chunk_ranges(days, align=align, tz_h=tz_h):
         part = _totals_single(token, ig_user_id, metrics, since, until,
                               context, **extra)
         for name, entry in part.items():
@@ -553,29 +613,36 @@ def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str]
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_account_totals_by_format(token: str, ig_user_id: str, days: int) -> dict:
+def fetch_account_totals_by_format(token: str, ig_user_id: str, days: int,
+                                   align: str = "day_floor",
+                                   tz_h: float = 0.0) -> dict:
     """Account totals WITH breakdown=media_product_type — Meta's own
     REELS vs FEED vs STORY vs AD split. All listed metrics support this
     breakdown per the IG User Insights reference."""
     return _totals_with_metric_dropping(
         token, ig_user_id,
         ["reach", "views", "likes", "comments", "saves", "shares", "total_interactions"],
-        days, "account totals by format", breakdown="media_product_type",
+        days, "account totals by format", align=align, tz_h=tz_h,
+        breakdown="media_product_type",
     )
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_account_totals_plain(token: str, ig_user_id: str, days: int) -> dict:
+def fetch_account_totals_plain(token: str, ig_user_id: str, days: int,
+                               align: str = "day_floor",
+                               tz_h: float = 0.0) -> dict:
     """Metrics that don't take the media_product_type breakdown."""
     return _totals_with_metric_dropping(
         token, ig_user_id,
         ["accounts_engaged", "replies", "reposts", "profile_links_taps"],
-        days, "account totals",
+        days, "account totals", align=align, tz_h=tz_h,
     )
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_profile_links_taps_by_button(token: str, ig_user_id: str, days: int) -> dict:
+def fetch_profile_links_taps_by_button(token: str, ig_user_id: str, days: int,
+                                       align: str = "day_floor",
+                                       tz_h: float = 0.0) -> dict:
     """profile_links_taps broken down by contact_button_type (call, email,
     direction, text, book-now, instant-experience) — which specific button
     people tap, not just the combined total already covered by
@@ -584,22 +651,26 @@ def fetch_profile_links_taps_by_button(token: str, ig_user_id: str, days: int) -
     along with them."""
     return _totals_with_metric_dropping(
         token, ig_user_id, ["profile_links_taps"], days,
-        "profile links taps by button", breakdown="contact_button_type",
+        "profile links taps by button", align=align, tz_h=tz_h,
+        breakdown="contact_button_type",
     )
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_follows_unfollows(token: str, ig_user_id: str, days: int) -> dict:
+def fetch_follows_unfollows(token: str, ig_user_id: str, days: int,
+                            align: str = "day_floor",
+                            tz_h: float = 0.0) -> dict:
     """follows_and_unfollows with breakdown=follow_type. Requires >=100
     followers; returns {} below that."""
     return _totals_with_metric_dropping(
         token, ig_user_id, ["follows_and_unfollows"], days,
-        "follows/unfollows", breakdown="follow_type",
+        "follows/unfollows", align=align, tz_h=tz_h, breakdown="follow_type",
     )
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_follower_split(token: str, ig_user_id: str, days: int) -> dict:
+def fetch_follower_split(token: str, ig_user_id: str, days: int,
+                         align: str = "day_floor", tz_h: float = 0.0) -> dict:
     """Followers vs non-followers split for views / reach / interactions —
     what Instagram's native 'Account insights' shows as 30.3% / 69.7%.
     Meta's docs name this breakdown inconsistently (follower_type for views,
@@ -610,7 +681,8 @@ def fetch_follower_split(token: str, ig_user_id: str, days: int) -> dict:
         for bd in ("follower_type", "follow_type"):
             res = _totals_with_metric_dropping(
                 token, ig_user_id, [metric], days,
-                f"{metric} follower split ({bd})", breakdown=bd)
+                f"{metric} follower split ({bd})", align=align, tz_h=tz_h,
+                breakdown=bd)
             if (res.get(metric) or {}).get("by"):
                 out[metric] = res[metric]
                 break
@@ -618,12 +690,15 @@ def fetch_follower_split(token: str, ig_user_id: str, days: int) -> dict:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_timeseries(token: str, ig_user_id: str, metric: str, days: int) -> list[dict]:
+def fetch_timeseries(token: str, ig_user_id: str, metric: str, days: int,
+                     align: str = "day_floor", tz_h: float = 0.0) -> list[dict]:
     """Daily time series -> [{"date": ..., "value": ...}], chunked into <=30d
     calls for longer windows. follower_count needs >=100 followers and Meta
-    serves only ~30 days of it — older chunks fail quietly into the log."""
+    serves only ~30 days of it — older chunks fail quietly into the log.
+    Uses the same window convention as the totals, so the reach cross-check
+    compares like for like."""
     out: list[dict] = []
-    for since, until in _chunk_ranges(days):
+    for since, until in _chunk_ranges(days, align=align, tz_h=tz_h):
         data, err = api_get(
             f"{ig_user_id}/insights", token,
             metric=metric, period="day", metric_type="time_series",
@@ -1225,6 +1300,22 @@ else:  # older Streamlit fallback
                        index=_window_opts.index(WINDOW_DAYS), horizontal=True)
 window_days = _picked or WINDOW_DAYS
 
+# --- Window alignment: which "last N days" convention to use -----------------
+with st.expander("Window alignment — for matching the native app's date range"):
+    _align_label = st.selectbox("Day boundary mode", list(WINDOW_ALIGN_MODES),
+                                index=0, key="win_align")
+    win_tz_h = st.number_input("Day boundary timezone (hours vs UTC)", value=0.0,
+                               step=0.5, min_value=-12.0, max_value=14.0,
+                               key="win_tz",
+                               help="Only moves where midnight falls for the day "
+                                    "boundary; API timestamps stay correct either "
+                                    "way. IST = 5.5")
+    st.caption("Instagram doesn't document which convention its own 'Last N days' "
+               "uses. Additive metrics (views, likes, interactions) move almost "
+               "linearly with window width, so try each mode against the app's "
+               "numbers; the queried range is shown in the summary line below.")
+win_align = WINDOW_ALIGN_MODES[_align_label]
+
 with st.spinner("Loading profile and account insights…"):
     identity = fetch_identity(token)
     ig_user_id = identity.get("user_id") or identity.get("id")
@@ -1237,14 +1328,21 @@ with st.spinner("Loading profile and account insights…"):
         st.stop()
     profile = fetch_profile(token, ig_user_id)
     followers = profile.get("followers_count", 0) or 0
-    posts = fetch_media_window(token, ig_user_id, window_days)
-    fmt_totals = fetch_account_totals_by_format(token, ig_user_id, window_days)
-    plain_totals = fetch_account_totals_plain(token, ig_user_id, window_days)
-    fu_totals = fetch_follows_unfollows(token, ig_user_id, window_days)
-    split_totals = fetch_follower_split(token, ig_user_id, window_days)
-    plr_totals = fetch_profile_links_taps_by_button(token, ig_user_id, window_days)
-    reach_series = fetch_timeseries(token, ig_user_id, "reach", window_days)
-    follower_series = fetch_timeseries(token, ig_user_id, "follower_count", window_days)
+    posts = fetch_media_window(token, ig_user_id, window_days, win_align, win_tz_h)
+    fmt_totals = fetch_account_totals_by_format(token, ig_user_id, window_days,
+                                                win_align, win_tz_h)
+    plain_totals = fetch_account_totals_plain(token, ig_user_id, window_days,
+                                              win_align, win_tz_h)
+    fu_totals = fetch_follows_unfollows(token, ig_user_id, window_days,
+                                        win_align, win_tz_h)
+    split_totals = fetch_follower_split(token, ig_user_id, window_days,
+                                        win_align, win_tz_h)
+    plr_totals = fetch_profile_links_taps_by_button(token, ig_user_id, window_days,
+                                                    win_align, win_tz_h)
+    reach_series = fetch_timeseries(token, ig_user_id, "reach", window_days,
+                                    win_align, win_tz_h)
+    follower_series = fetch_timeseries(token, ig_user_id, "follower_count",
+                                       window_days, win_align, win_tz_h)
 
 # Per-media type-specific insights (watch time, skip rate, follows, visits)
 extras: dict[str, dict] = {}
@@ -1304,7 +1402,7 @@ with col_actions:
 
 st.markdown(f'<div class="section-eyebrow">Last {window_days} days · '
             f'{len(posts)} posts ({len(reels)} reels, {len(feed)} feed) · '
-            f'account totals queried {window_bounds_label(window_days)}</div>',
+            f'window queried {window_bounds_label(window_days, win_align, win_tz_h)}</div>',
             unsafe_allow_html=True)
 
 _media_errs = [e for e in st.session_state.get("api_errors", [])
@@ -1394,7 +1492,11 @@ with tab_overview:
             f"daily reach as deduplicated within each day only, not across the window, "
             f"so these are not expected to match — shown so you can compare both against "
             f"what Instagram's own app reports for the same nominal period, rather than "
-            f"trusting either number blind."
+            f"trusting either number blind. Views total_value for this window: "
+            f"{fmt_int(total_of('views', fmt_totals))} — views is additive, so it moves "
+            f"almost linearly with window width; if the app shows fewer views, the app's "
+            f"window is narrower than the one queried above (try the window-alignment "
+            f"expander at the top)."
         )
     else:
         st.caption("Reach cross-check unavailable — the daily reach series returned no "
@@ -1742,9 +1844,12 @@ with tab_data:
     st.markdown('<div class="section-eyebrow">Window debug</div>', unsafe_allow_html=True)
     st.json({
         "window_days": window_days,
-        "account_totals_queried_utc": window_bounds_label(window_days),
+        "window_align_mode": win_align,
+        "window_tz_offset_hours": win_tz_h,
+        "window_queried": window_bounds_label(window_days, win_align, win_tz_h),
         "reach_total_value": schema_metrics["total_reach_30d"],
         "reach_series_sum": _series_reach_sum,
+        "views_total_value": total_of("views", fmt_totals),
     })
 
     errs = st.session_state.get("api_errors", [])
