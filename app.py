@@ -1,7 +1,34 @@
 """
-Instagram Business Insights — Streamlit app (v6)
+Instagram Business Insights — Streamlit app (v7)
 Instagram API with Instagram Login only (graph.instagram.com / api.instagram.com).
 No Facebook Login, no graph.facebook.com anywhere in this file.
+
+WHAT CHANGED vs v6 — inferred niche (category), since the API has none
+-----------------------------------------------------------------------
+1. The IG User node exposes NO category field on either login variant
+   (verified against the v25 reference), so the profile label ("Digital
+   creator" etc.) cannot be fetched. Added instead: infer_categories() — a
+   deterministic, keyword-based niche classifier over data the app already
+   pulls with the user's consent: biography, name, username, website, post
+   captions, and hashtags. Weighted scoring (profile text 3x, website and
+   hashtags 2x, captions 1x, capped per term), word-boundary matching for
+   plain words, substring matching for handle-glued terms like "d2c" in
+   "d2cwithgirish". Returns top categories with a share % and the matched
+   terms as evidence, or nothing when signal is too weak — it never
+   invents a label.
+2. Shown in the header ("Inferred niche … — top signals: …"), clearly
+   marked as a heuristic, and dumped in Data -> Extended metrics as
+   category_inferred. NOT added to build_db_rows — schema shapes stay
+   byte-identical; add a column downstream only if you want it.
+3. Deliberately NOT an LLM call: that would hard-code a model provider and
+   a new secret into a dashboard that currently needs only Meta
+   credentials, and add a paid failure mode to every page load. The
+   function is a marked seam — swap its body for a call to your own model
+   service and keep the return shape. For the marketplace itself,
+   self-declared category at onboarding still beats any inference.
+4. Taxonomy is a plain dict (CATEGORY_KEYWORDS) at module level — edit it
+   freely; English/Hinglish-leaning coverage, imperfect by design and
+   labeled as such.
 
 WHAT CHANGED vs v5 — profile field coverage completed; a permission declined
 -----------------------------------------------------------------------------
@@ -174,6 +201,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 import secrets as pysecrets
 import statistics
 from datetime import datetime, timedelta, timezone
@@ -840,6 +868,139 @@ def fetch_demographics(token: str, ig_user_id: str, metric: str,
 # 5. METRICS
 # ---------------------------------------------------------------------------
 
+# Niche taxonomy for infer_categories(). Plain data on purpose — edit freely.
+# All terms lowercase. Multi-word terms match as substrings; single words
+# match on word boundaries (so "art" never fires inside "start"); terms with
+# digits or length >= 4 also substring-match inside handles, URLs, and
+# hashtags (so "d2c" fires inside "d2cwithgirish").
+CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "D2C & E-commerce": ["d2c", "ecommerce", "e-commerce", "shopify", "dropshipping",
+                         "online store", "amazon", "flipkart", "meesho",
+                         "quick commerce", "brand owner", "cod orders"],
+    "Marketing & Growth": ["performance marketing", "digital marketing", "meta ads",
+                           "facebook ads", "google ads", "roas", "funnel",
+                           "conversion", "seo", "copywriting", "branding",
+                           "growth tactics", "agency", "ad creative"],
+    "Business & Startups": ["founder", "entrepreneur", "startup", "bootstrapped",
+                            "business growth", "b2b", "ceo", "venture", "scaling"],
+    "Finance & Investing": ["personal finance", "investing", "stock market",
+                            "mutual fund", "trading", "crypto", "wealth", "sip",
+                            "tax saving", "financial freedom"],
+    "Tech & AI": ["artificial intelligence", " ai ", "saas", "software", "coding",
+                  "developer", "automation", "robotics", "gadgets", "no-code"],
+    "Fashion": ["fashion", "outfit", "ootd", "streetwear", "saree", "ethnic wear",
+                "lookbook", "styling"],
+    "Beauty & Skincare": ["beauty", "makeup", "skincare", "cosmetics", "haircare",
+                          "lipstick", "glowup"],
+    "Fitness": ["fitness", "gym", "workout", "bodybuilding", "yoga", "trainer",
+                "calisthenics", "protein", "transformation"],
+    "Health & Wellness": ["wellness", "nutrition", "diet", "mental health",
+                          "ayurveda", "weight loss", "healthy habits"],
+    "Food & Cooking": ["food", "recipe", "cooking", "foodie", "chef", "restaurant",
+                       "street food", "baking"],
+    "Travel": ["travel", "wanderlust", "itinerary", "backpacking", "roadtrip",
+               "tourism", "hidden gems"],
+    "Education & Career": ["education", "learning", "study tips", "upsc", "career",
+                           "skills", "course", "teacher", "coaching", "exam"],
+    "Entertainment & Comedy": ["comedy", "memes", "funny", "sketch", "standup",
+                               "entertainment", "prank"],
+    "Music & Dance": ["music", "singer", "musician", "dance", "choreography",
+                      "cover song", "playlist"],
+    "Art & Design": ["artist", "illustration", "graphic design", "ui design",
+                     "ux design", "painting", "typography"],
+    "Photography & Video": ["photography", "photographer", "videography",
+                            "filmmaker", "video editing", "cinematic", "dslr"],
+    "Gaming": ["gaming", "gamer", "esports", "streamer", "bgmi", "valorant",
+               "minecraft"],
+    "Parenting & Family": ["parenting", "momlife", "dadlife", "toddler",
+                           "newborn", "kids activities"],
+    "Motivation & Lifestyle": ["motivation", "mindset", "self improvement",
+                               "productivity", "habits", "discipline",
+                               "lifestyle"],
+}
+
+CATEGORY_MIN_SCORE = 4.0     # below this, infer_categories() reports nothing
+_CAPTION_TERM_CAP = 5        # a term counts at most this many captions
+
+
+def _match_terms_text(text: str, terms: list[str]) -> set[str]:
+    """Word-boundary matching for plain prose (bio, captions)."""
+    found = set()
+    for t in terms:
+        t_ = t.strip()
+        if " " in t_ or "-" in t_:
+            if t_ in text:
+                found.add(t)
+        elif re.search(rf"\b{re.escape(t_)}\b", text):
+            found.add(t)
+    return found
+
+
+def _match_terms_glued(text: str, terms: list[str]) -> set[str]:
+    """Substring matching for handles, URLs, and hashtags, where words glue
+    together ('d2cwithgirish', '#performancemarketing'). Only terms that are
+    multi-word, contain a digit, or are >= 4 chars qualify — short generic
+    words like 'ai' or 'art' would false-positive inside random strings."""
+    found = set()
+    squashed = text.replace(" ", "")
+    for t in terms:
+        t_ = t.strip().replace(" ", "")
+        if " " in t or any(ch.isdigit() for ch in t_) or len(t_) >= 4:
+            if t_ and t_ in squashed:
+                found.add(t)
+    return found
+
+
+def infer_categories(profile: dict, identity: dict, posts: list[dict],
+                     top_n: int = 3) -> list[dict]:
+    """Deterministic niche inference from data the app already pulls with
+    consent: bio + name + username (weight 3), website + hashtags (weight 2),
+    caption prose (weight 1, capped per term). Returns up to top_n dicts
+    {category, score, share_pct, evidence} sorted by score, or [] when the
+    best score is under CATEGORY_MIN_SCORE — no label is better than a
+    made-up one.
+
+    UPGRADE SEAM: to switch to model-based classification, replace this
+    body with a call to your own model service and keep the return shape;
+    everything downstream (header caption, Data-tab JSON) stays valid."""
+    prof_text = " ".join(str(x or "") for x in (
+        profile.get("biography"), identity.get("name"))).lower()
+    glued_text = " ".join(str(x or "") for x in (
+        identity.get("username"), profile.get("website"))).lower()
+    captions = [(p.get("caption") or "").lower() for p in posts]
+    hashtags = " ".join(tag for c in captions for tag in re.findall(r"#(\w+)", c))
+
+    results = []
+    for category, terms in CATEGORY_KEYWORDS.items():
+        score = 0.0
+        evidence: set[str] = set()
+        hits = _match_terms_text(prof_text, terms)
+        score += 3.0 * len(hits)
+        evidence |= hits
+        hits = _match_terms_glued(glued_text, terms)
+        score += 2.0 * len(hits)
+        evidence |= hits
+        hits = _match_terms_glued(hashtags, terms)
+        score += 2.0 * len(hits)
+        evidence |= hits
+        for t in terms:
+            n_caps = sum(1 for c in captions if _match_terms_text(c, [t]))
+            if n_caps:
+                score += 1.0 * min(n_caps, _CAPTION_TERM_CAP)
+                evidence.add(t)
+        if score > 0:
+            results.append({"category": category, "score": round(score, 1),
+                            "evidence": sorted(evidence)[:6]})
+    results.sort(key=lambda r: r["score"], reverse=True)
+    if not results or results[0]["score"] < CATEGORY_MIN_SCORE:
+        return []
+    total = sum(r["score"] for r in results) or 1.0
+    out = results[:top_n]
+    for r in out:
+        r["share_pct"] = round(r["score"] / total * 100, 1)
+    return out
+
+
 def _post_insight_value(post: dict, name: str) -> int:
     for m in (post.get("insights") or {}).get("data", []):
         if m.get("name") == name:
@@ -1441,6 +1602,7 @@ reels_stats = group_stats(reels, followers, extras)
 feed_stats = group_stats(feed, followers, extras)
 schema_metrics = compute_schema_metrics(posts, followers, fmt_totals)
 industry_er = compute_industry_engagement_rate(posts, followers)
+category_inferred = infer_categories(profile, identity, posts)
 _series_reach_sum = sum(r["value"] for r in reach_series) if reach_series else None
 
 
@@ -1470,6 +1632,11 @@ with col_info:
         st.caption(profile["biography"])
     if profile.get("website"):
         st.caption(f"🔗 {profile['website']}")
+    if category_inferred:
+        _cats = " · ".join(f"{c['category']} {c['share_pct']}%" for c in category_inferred)
+        _sig = ", ".join(category_inferred[0]["evidence"])
+        st.caption(f"Inferred niche (keyword heuristic — Instagram's API exposes no "
+                   f"category field): {_cats} — top signals: {_sig}")
 with col_actions:
     if st.button("↻ Refresh data", use_container_width=True):
         st.cache_data.clear()
@@ -1915,6 +2082,7 @@ with tab_data:
                 unsafe_allow_html=True)
     st.json({
         "profile": profile,
+        "category_inferred": category_inferred,
         "reels_30d": reels_stats,
         "feed_30d": feed_stats,
         "account_totals_by_format": fmt_totals,
