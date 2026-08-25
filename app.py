@@ -1,7 +1,52 @@
 """
-Instagram Business Insights — Streamlit app (v2)
+Instagram Business Insights — Streamlit app (v3)
 Instagram API with Instagram Login only (graph.instagram.com / api.instagram.com).
 No Facebook Login, no graph.facebook.com anywhere in this file.
+
+WHAT CHANGED vs v2 — nothing removed, all additive/corrective
+---------------------------------------------------------------
+1. _chunk_ranges() now floors `since` to the start of its UTC day instead of
+   the exact instant the code ran. Every account-level total_value call goes
+   through this (reach, views, likes, comments, saves, shares,
+   total_interactions, accounts_engaged, replies, reposts,
+   profile_links_taps, follows_and_unfollows, the new
+   profile_links_taps-by-button call, and both time series) — so this shifts
+   MOST account-level numbers slightly, not just reach, and it shifts them
+   up (the window gets up to ~24h wider, never narrower). Rationale: reach
+   and friends are aggregated by whole days server-side; a `since` landing
+   mid-day risked Meta rounding away part of that first day, which is one
+   documented, named cause of API-vs-native-app number mismatches. This is a
+   reasoned improvement, not a confirmed fix — Meta doesn't publicly
+   document its own day-boundary/timezone convention for "last N days" in
+   the app, so treat this as the best available default and validate against
+   the app using the two additions below, not as a guarantee of an exact
+   match.
+2. window_bounds_label() + a caption in Overview surface the exact UTC
+   since/until every account-level call used, so you can compare it directly
+   against whatever date range Instagram's own app shows for its "last N
+   days" — the fastest way to confirm or rule out point 1 empirically.
+3. A visible reach cross-check in Overview + Data: account total_value reach
+   vs. the sum of the daily reach time-series for the same window. Meta
+   documents daily reach as deduplicated within each day only, not across
+   the window, so these are not expected to match — shown so you can see the
+   gap yourself instead of taking a comment's word for it. Two KPI sub-labels
+   that flatly asserted "sum of daily values" (unconfirmed) now point here
+   instead.
+4. Two more insights extracted, previously available but unused:
+     - Media-level `profile_activity`, broken down by action_type (bio-link
+       tap, call, email, direction, text) — what someone did after visiting
+       your profile from a specific post. Distinct from profile_visits,
+       which only says a visit happened. New: Feed tab KPI + breakdown bars,
+       a post-card chip, a "Top content" rank-by option, and a column in the
+       feed data table.
+     - Account-level `profile_links_taps`, now also fetched WITH its
+       contact_button_type breakdown (call/email/direction/text/book-now),
+       alongside the existing flat total — new breakdown bars in Overview.
+   Cost: one extra API call per feed post during per-post enrichment
+   (profile_activity needs its own call — Meta errors a batched request if
+   one metric in it doesn't support the requested breakdown). Feed-heavy
+   accounts near MAX_ENRICHED_MEDIA will feel this; nothing else changed
+   about that cap.
 
 WHAT CHANGED vs v1 (audit summary)
 ----------------------------------
@@ -350,19 +395,57 @@ def fetch_media_window(token: str, ig_user_id: str, days: int) -> list[dict]:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_media_extras(token: str, media_id: str, product_type: str) -> dict:
-    """Type-specific per-media insights. REELS: watch time + skip rate.
-    FEED: follows + profile_visits. Returns {} on any error (some metrics
-    are flagged 'in development' by Meta and can be absent per account)."""
-    metric = REELS_EXTRA_METRICS if product_type == "REELS" else FEED_EXTRA_METRICS
-    data, err = api_get(f"{media_id}/insights", token, metric=metric)
+    """Type-specific per-media insights. REELS: watch time + skip rate (one
+    call, unchanged). FEED: follows + profile_visits, PLUS profile_activity
+    broken down by action_type — what someone did after visiting your
+    profile from this post (bio-link tap, call, email, direction, text),
+    which is a different signal than profile_visits (a visit happened) or
+    follows (they followed). profile_activity needs a separate call: it's
+    the only metric here that takes a breakdown, and Meta errors the whole
+    request if one metric in a batch doesn't support the breakdown given to
+    it. The two FEED calls are independent, so one failing still returns
+    whatever the other got — strictly more resilient than a single
+    all-or-nothing call. Returns {} keys are simply omitted on error (some
+    metrics are flagged 'in development' by Meta and can be absent per
+    account)."""
+    if product_type == "REELS":
+        data, err = api_get(f"{media_id}/insights", token, metric=REELS_EXTRA_METRICS)
+        if err:
+            _record_error(f"media extras {media_id}", err)
+            return {}
+        out = {}
+        for m in data.get("data", []):
+            vals = m.get("values", [])
+            if vals and isinstance(vals[0], dict):
+                out[m.get("name")] = vals[0].get("value", 0)
+        return out
+
+    out = {}
+    data, err = api_get(f"{media_id}/insights", token, metric=FEED_EXTRA_METRICS)
     if err:
         _record_error(f"media extras {media_id}", err)
-        return {}
-    out = {}
-    for m in data.get("data", []):
-        vals = m.get("values", [])
-        if vals and isinstance(vals[0], dict):
-            out[m.get("name")] = vals[0].get("value", 0)
+    else:
+        for m in data.get("data", []):
+            vals = m.get("values", [])
+            if vals and isinstance(vals[0], dict):
+                out[m.get("name")] = vals[0].get("value", 0)
+
+    pa_data, pa_err = api_get(f"{media_id}/insights", token,
+                              metric="profile_activity", breakdown="action_type")
+    if pa_err:
+        _record_error(f"media profile_activity {media_id}", pa_err)
+    else:
+        for m in pa_data.get("data", []):
+            vals = m.get("values", [])
+            if vals and isinstance(vals[0], dict):
+                out["profile_activity"] = vals[0].get("value", 0)
+            by = {}
+            for bd in (m.get("total_value", {}) or {}).get("breakdowns", []) or []:
+                for res in bd.get("results", []) or []:
+                    dims = res.get("dimension_values", []) or ["?"]
+                    by[dims[-1]] = by.get(dims[-1], 0) + res.get("value", 0)
+            if by:
+                out["profile_activity_by_action"] = by
     return out
 
 
@@ -387,15 +470,42 @@ def _parse_total_value_payload(data: dict) -> dict:
 
 def _chunk_ranges(days: int, max_span: int = 30) -> list[tuple[int, int]]:
     """Split the window into <=max_span-day (since, until) unix pairs — Meta
-    serves short insight ranges, so 90d becomes three 30d calls."""
+    serves short insight ranges, so 90d becomes three 30d calls.
+
+    `since` is floored to 00:00 UTC of its day rather than left at the exact
+    instant the code happened to run. Reach and the other interaction
+    metrics are aggregated by whole days server-side; an unaligned `since`
+    risks Meta rounding away part of that first day, silently narrowing the
+    window versus a calendar-day "last N days" — which is very likely how
+    Instagram's own app computes its window. Flooring costs at most ~24h of
+    EXTRA data at the start rather than risking losing it. `until` is left
+    as the exact current moment, unchanged, so "today so far" is still
+    included exactly as before — only the lower boundary moved.
+
+    This narrows one candidate cause of API-vs-app mismatches; it is not a
+    guaranteed exact match, since Meta doesn't publicly document the app's
+    own day-inclusion/timezone convention. Use window_bounds_label() to see
+    the exact range this produces and compare it against the app."""
     now = datetime.now(timezone.utc)
-    cur = now - timedelta(days=days)
+    cur = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
     out = []
     while cur < now:
         nxt = min(cur + timedelta(days=max_span), now)
         out.append((int(cur.timestamp()), int(nxt.timestamp())))
         cur = nxt
     return out
+
+
+def window_bounds_label(days: int) -> str:
+    """Human-readable (since, until) for the full window, in UTC — for
+    comparing against whatever date range Instagram's app shows for the
+    same nominal 'last N days' period."""
+    ranges = _chunk_ranges(days)
+    if not ranges:
+        return "—"
+    since_dt = datetime.fromtimestamp(ranges[0][0], tz=timezone.utc)
+    until_dt = datetime.fromtimestamp(ranges[-1][1], tz=timezone.utc)
+    return f"{since_dt:%Y-%m-%d %H:%M} \u2192 {until_dt:%Y-%m-%d %H:%M} UTC"
 
 
 def _totals_single(token: str, ig_user_id: str, metrics: list[str],
@@ -461,6 +571,20 @@ def fetch_account_totals_plain(token: str, ig_user_id: str, days: int) -> dict:
         token, ig_user_id,
         ["accounts_engaged", "replies", "reposts", "profile_links_taps"],
         days, "account totals",
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_profile_links_taps_by_button(token: str, ig_user_id: str, days: int) -> dict:
+    """profile_links_taps broken down by contact_button_type (call, email,
+    direction, text, book-now, instant-experience) — which specific button
+    people tap, not just the combined total already covered by
+    fetch_account_totals_plain. Separate call: accounts_engaged/replies/
+    reposts in that batch don't support this breakdown, so it can't ride
+    along with them."""
+    return _totals_with_metric_dropping(
+        token, ig_user_id, ["profile_links_taps"], days,
+        "profile links taps by button", breakdown="contact_button_type",
     )
 
 
@@ -600,6 +724,8 @@ def group_stats(posts: list[dict], followers: int,
     watch_avgs_s, skip_rates = [], []
     total_watch_s = 0.0
     follows_sum, visits_sum = 0, 0
+    profile_activity_sum = 0
+    profile_activity_by_action: dict[str, int] = {}
 
     for p in posts:
         reach = _post_insight_value(p, "reach")
@@ -627,6 +753,9 @@ def group_stats(posts: list[dict], followers: int,
             skip_rates.append(float(ex["reels_skip_rate"]))
         follows_sum += ex.get("follows", 0) or 0
         visits_sum += ex.get("profile_visits", 0) or 0
+        profile_activity_sum += ex.get("profile_activity", 0) or 0
+        for action, cnt in (ex.get("profile_activity_by_action") or {}).items():
+            profile_activity_by_action[action] = profile_activity_by_action.get(action, 0) + cnt
 
     reach_sum = sums["reach"]
 
@@ -654,6 +783,10 @@ def group_stats(posts: list[dict], followers: int,
         out["follows_from_posts"] = follows_sum
         out["profile_visits_from_posts"] = visits_sum
         out["follow_conversion"] = rate(follows_sum)     # follows per 100 reached
+    if profile_activity_sum:
+        out["profile_activity_from_posts"] = profile_activity_sum
+    if profile_activity_by_action:
+        out["profile_activity_by_action"] = profile_activity_by_action
     return out
 
 
@@ -885,7 +1018,7 @@ def render_pct_block(title: str, by: dict, sub: str = "") -> str:
         pct = v / total * 100
         rows.append(
             f'<div class="pct-row">'
-            f'<span class="pct-label">{html.escape(_FORMAT_LABELS.get(key, key.title()))}</span>'
+            f'<span class="pct-label">{html.escape(_FORMAT_LABELS.get(key, key.replace("_", " ").title()))}</span>'
             f'<span class="pct-track"><span class="pct-fill" style="width:{pct:.1f}%"></span></span>'
             f'<span class="pct-val">{pct:.1f}%</span></div>')
     sub_html = f'<div class="pct-sub">{html.escape(sub)}</div>' if sub else ""
@@ -945,6 +1078,8 @@ def render_post_card(post: dict, rank: int, extras: dict) -> str:
         chips += f'<span class="post-chip">➕ {fmt_int(ex["follows"])} follows</span>'
     if ex.get("profile_visits"):
         chips += f'<span class="post-chip">👤 {fmt_int(ex["profile_visits"])} profile visits</span>'
+    if ex.get("profile_activity"):
+        chips += f'<span class="post-chip">🔗 {fmt_int(ex["profile_activity"])} profile actions</span>'
 
     return _compact_html(f"""
     <a href="{permalink}" target="_blank" rel="noopener" class="post-card">
@@ -1107,6 +1242,7 @@ with st.spinner("Loading profile and account insights…"):
     plain_totals = fetch_account_totals_plain(token, ig_user_id, window_days)
     fu_totals = fetch_follows_unfollows(token, ig_user_id, window_days)
     split_totals = fetch_follower_split(token, ig_user_id, window_days)
+    plr_totals = fetch_profile_links_taps_by_button(token, ig_user_id, window_days)
     reach_series = fetch_timeseries(token, ig_user_id, "reach", window_days)
     follower_series = fetch_timeseries(token, ig_user_id, "follower_count", window_days)
 
@@ -1114,7 +1250,7 @@ with st.spinner("Loading profile and account insights…"):
 extras: dict[str, dict] = {}
 enrich = posts[:MAX_ENRICHED_MEDIA]
 if enrich:
-    prog = st.progress(0.0, text="Loading per-post insights (watch time, follows)…")
+    prog = st.progress(0.0, text="Loading per-post insights (watch time, follows, profile activity)…")
     for i, p in enumerate(enrich):
         extras[p["id"]] = fetch_media_extras(
             token, p["id"], p.get("media_product_type") or "")
@@ -1130,6 +1266,7 @@ reels_stats = group_stats(reels, followers, extras)
 feed_stats = group_stats(feed, followers, extras)
 schema_metrics = compute_schema_metrics(posts, followers, fmt_totals)
 industry_er = compute_industry_engagement_rate(posts, followers)
+_series_reach_sum = sum(r["value"] for r in reach_series) if reach_series else None
 
 
 def total_of(name: str, source: dict) -> int:
@@ -1166,7 +1303,8 @@ with col_actions:
         st.rerun()
 
 st.markdown(f'<div class="section-eyebrow">Last {window_days} days · '
-            f'{len(posts)} posts ({len(reels)} reels, {len(feed)} feed)</div>',
+            f'{len(posts)} posts ({len(reels)} reels, {len(feed)} feed) · '
+            f'account totals queried {window_bounds_label(window_days)}</div>',
             unsafe_allow_html=True)
 
 _media_errs = [e for e in st.session_state.get("api_errors", [])
@@ -1201,7 +1339,7 @@ with tab_overview:
         render_kpi("Views", fmt_int(total_of("views", fmt_totals)),
                    "account total, all formats (Meta 'in development')"),
         render_kpi("Reach", fmt_int(total_of("reach", fmt_totals)),
-                   "Meta's window total (sum of daily values — cross-day dedup not guaranteed)"),
+                   "Meta's window total, estimated — see reach cross-check below"),
         render_kpi("Accounts engaged", fmt_int(total_of("accounts_engaged", plain_totals)),
                    "unique accounts that interacted (estimated)"),
         render_kpi("Interactions", fmt_int(total_of("total_interactions", fmt_totals)),
@@ -1239,7 +1377,7 @@ with tab_overview:
                    "each post's engagement ÷ its own reach, then averaged"),
         render_kpi("Avg likes / post", f"{schema_metrics['avg_likes_30d']}"),
         render_kpi(f"Total reach ({window_days}d)", fmt_int(schema_metrics['total_reach_30d']),
-                   "Meta's window total (sum of daily values)"),
+                   "Meta's window total — see reach cross-check below"),
     ])
     st.markdown(f'<div class="kpi-grid">{v1_cells}</div>', unsafe_allow_html=True)
     st.caption("Four different engagement-rate numbers on purpose — they answer different "
@@ -1247,6 +1385,26 @@ with tab_overview:
                + ("" if window_days == 30 else
                   f" Note: computed over your selected {window_days}-day window even "
                   f"though the schema columns are named _30d."))
+
+    if _series_reach_sum is not None:
+        st.caption(
+            f"Reach cross-check — account total_value reach: "
+            f"{fmt_int(schema_metrics['total_reach_30d'])} vs. sum of the daily reach "
+            f"series for the same window: {fmt_int(_series_reach_sum)}. Meta documents "
+            f"daily reach as deduplicated within each day only, not across the window, "
+            f"so these are not expected to match — shown so you can compare both against "
+            f"what Instagram's own app reports for the same nominal period, rather than "
+            f"trusting either number blind."
+        )
+    else:
+        st.caption("Reach cross-check unavailable — the daily reach series returned no "
+                   "rows for this window.")
+
+    # --- Profile link taps by button (new — was only a flat total before) ---
+    _plt_by = (plr_totals.get("profile_links_taps") or {}).get("by", {})
+    if _plt_by:
+        st.markdown(render_pct_block("Profile link taps by button", _plt_by),
+                    unsafe_allow_html=True)
 
     # --- Native-style content-type split (matches the in-app Account insights) ---
     st.markdown('<div class="section-eyebrow">By content type — like the native '
@@ -1323,6 +1481,7 @@ with tab_overview:
             "Shares": ("ins", "shares"),
             "Follows (feed only)": ("extra", "follows"),
             "Profile visits (feed only)": ("extra", "profile_visits"),
+            "Profile activity (feed only)": ("extra", "profile_activity"),
         }
         tc1, tc2, tc3, tc4 = st.columns([2, 1, 1, 1])
         sel_metric = tc1.selectbox("Rank by", list(_metric_opts), key="top_metric")
@@ -1438,7 +1597,17 @@ with tab_feed:
             fk.append(render_kpi("Profile visits from posts",
                                  fmt_int(feed_stats["profile_visits_from_posts"]),
                                  "visits driven by feed posts"))
+        if "profile_activity_from_posts" in feed_stats:
+            fk.append(render_kpi("Profile actions from posts",
+                                 fmt_int(feed_stats["profile_activity_from_posts"]),
+                                 "bio-link taps, calls, emails, directions, texts after "
+                                 "visiting from a post"))
         st.markdown(f'<div class="kpi-grid">{"".join(fk)}</div>', unsafe_allow_html=True)
+
+        if feed_stats.get("profile_activity_by_action"):
+            st.markdown(render_pct_block("Profile actions by type",
+                                         feed_stats["profile_activity_by_action"]),
+                        unsafe_allow_html=True)
 
         st.markdown('<div class="section-eyebrow">Top feed posts</div>', unsafe_allow_html=True)
         top_f = rank_top_posts(feed)
@@ -1462,6 +1631,7 @@ with tab_feed:
                     "saves": _post_insight_value(p, "saved"),
                     "follows": ex.get("follows"),
                     "profile visits": ex.get("profile_visits"),
+                    "profile activity": ex.get("profile_activity"),
                     "link": p.get("permalink"),
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True,
@@ -1566,6 +1736,15 @@ with tab_data:
         "account_totals_by_format": fmt_totals,
         "account_totals": plain_totals,
         "follows_and_unfollows": fu_totals,
+        "profile_links_taps_by_button": plr_totals,
+    })
+
+    st.markdown('<div class="section-eyebrow">Window debug</div>', unsafe_allow_html=True)
+    st.json({
+        "window_days": window_days,
+        "account_totals_queried_utc": window_bounds_label(window_days),
+        "reach_total_value": schema_metrics["total_reach_30d"],
+        "reach_series_sum": _series_reach_sum,
     })
 
     errs = st.session_state.get("api_errors", [])
