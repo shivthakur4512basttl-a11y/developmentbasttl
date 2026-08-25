@@ -102,6 +102,13 @@ MEDIA_FIELDS = (
     f"insights.metric({COMMON_MEDIA_INSIGHTS})"
 )
 
+# Fallback field set: same media data, NO insights expansion. Used when Meta
+# rejects the whole expanded /media call (one bad metric fails the request).
+BASIC_MEDIA_FIELDS = (
+    "id,timestamp,permalink,caption,media_type,media_product_type,"
+    "media_url,thumbnail_url,like_count,comments_count"
+)
+
 REELS_EXTRA_METRICS = "ig_reels_avg_watch_time,ig_reels_video_view_total_time,reels_skip_rate"
 FEED_EXTRA_METRICS = "follows,profile_visits"
 
@@ -248,28 +255,96 @@ def fetch_profile(token: str, ig_user_id: str) -> dict:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_common_media_insights(token: str, media_id: str) -> dict:
+    """Fallback: the common insight set for ONE media item, same shape as the
+    field-expansion output. Drops any metric Meta names in its error and
+    retries, so one unsupported metric can't zero out the rest."""
+    remaining = COMMON_MEDIA_INSIGHTS.split(",")
+    for _ in range(3):
+        if not remaining:
+            return {}
+        data, err = api_get(f"{media_id}/insights", token, metric=",".join(remaining))
+        if not err:
+            return {"data": data.get("data", [])}
+        msg = str(err.get("message", "")).lower()
+        dropped = [m for m in remaining if m in msg]
+        if not dropped:
+            _record_error(f"media insights {media_id}", err)
+            return {}
+        for m in dropped:
+            remaining.remove(m)
+    return {}
+
+
+def _parse_ig_timestamp(raw: str) -> datetime | None:
+    """IG uses '2026-08-20T12:34:56+0000'. Tolerate fractional seconds and
+    ISO variants; assume UTC if no offset survives parsing."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except (TypeError, ValueError):
+            pass
+    try:
+        ts = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_media_window(token: str, ig_user_id: str, days: int) -> list[dict]:
-    """All media in the last `days` days with the COMMON insight set attached.
-    Media edge returns newest-first, so we stop at the first item past cutoff."""
+    """All media published in the last `days` days, with the common insight
+    set attached.
+
+    Resilience: if the insights field expansion makes the whole /media call
+    fail (Meta rejects the entire request when one expanded metric is
+    unavailable), retry WITHOUT the expansion and fetch each post's insights
+    individually. A failed expansion must never masquerade as '0 posts'.
+
+    Ordering: does NOT assume strict newest-first (pinned posts could break
+    that). Items are filtered by timestamp; pagination stops only when an
+    entire page falls outside the window. If items came back but none landed
+    in the window, a diagnostic is recorded instead of a silent zero."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     posts: list[dict] = []
+    expansion_ok = True
     data, err = api_get(f"{ig_user_id}/media", token, fields=MEDIA_FIELDS, limit=50)
+    if err:
+        _record_error("media list (insights expansion failed — retrying without it)", err)
+        expansion_ok = False
+        data, err = api_get(f"{ig_user_id}/media", token,
+                            fields=BASIC_MEDIA_FIELDS, limit=50)
+    seen = skipped_parse = 0
     while True:
         if err:
             _record_error("media list", err)
             break
-        for post in data.get("data", []):
-            try:
-                ts = datetime.strptime(post["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
-            except (KeyError, ValueError):
+        page = data.get("data", [])
+        seen += len(page)
+        page_has_recent = False
+        for post in page:
+            ts = _parse_ig_timestamp(post.get("timestamp", ""))
+            if ts is None:
+                skipped_parse += 1
                 continue
-            if ts < cutoff:
-                return posts
-            posts.append(post)
+            if ts >= cutoff:
+                posts.append(post)
+                page_has_recent = True
+        if page and not page_has_recent:
+            break  # whole page older than the window — done
         next_url = data.get("paging", {}).get("next")
         if not next_url:
             break
         data, err = api_get_absolute(next_url)
+    if seen and not posts:
+        msg = (f"The API returned {seen} media item(s) but none were inside "
+               f"the last {days} days")
+        if skipped_parse:
+            msg += f"; {skipped_parse} timestamp(s) failed to parse"
+        _record_error("media window", {"message": msg})
+    if not expansion_ok:
+        for post in posts:
+            post["insights"] = fetch_common_media_insights(token, post["id"])
     return posts
 
 
@@ -302,6 +377,10 @@ def _parse_total_value_payload(data: dict) -> dict:
             for res in bd.get("results", []) or []:
                 dims = res.get("dimension_values", []) or ["?"]
                 entry["by"][dims[-1]] = entry["by"].get(dims[-1], 0) + res.get("value", 0)
+        # Meta omits the top-level value on some breakdown responses -> 0 total
+        # alongside a non-zero breakdown. Prefer the breakdown sum in that case.
+        if not entry["total"] and entry["by"]:
+            entry["total"] = sum(entry["by"].values())
         out[name] = entry
     return out
 
@@ -971,11 +1050,36 @@ st.markdown(f'<div class="section-eyebrow">Last {WINDOW_DAYS} days · '
             f'{len(posts)} posts ({len(reels)} reels, {len(feed)} feed)</div>',
             unsafe_allow_html=True)
 
+_media_errs = [e for e in st.session_state.get("api_errors", [])
+               if str(e.get("context", "")).startswith("media list")]
+if not posts and _media_errs:
+    _first = _media_errs[0].get("error", {})
+    st.error("Your posts list could not be loaded, so every post-based metric "
+             "(all ER formulas, avg likes, Reels/Feed tabs) is empty for that "
+             f"reason — not because you didn't post. Meta's error: "
+             f"{_first.get('message', _first)}")
+elif not posts:
+    st.caption("No posts were published in this window, so the post-based metrics "
+               "(ER formulas, avg likes) are zero by definition. The account totals "
+               "still move because older posts, reels, and stories keep earning "
+               "views, reach, and interactions after publication.")
+
 tab_overview, tab_reels, tab_feed, tab_audience, tab_data = st.tabs(
     ["Overview", "Reels", "Feed posts", "Audience", "Data"])
 
 # --- OVERVIEW ---------------------------------------------------------------
 with tab_overview:
+    if not posts:
+        media_errs = [e for e in st.session_state.get("api_errors", [])
+                      if str(e.get("context", "")).startswith("media")]
+        if media_errs:
+            st.warning(f"No posts loaded for the last {WINDOW_DAYS} days — the media "
+                       f"request reported a problem. Details: Data tab → API warnings. "
+                       f"Post-derived metrics below will read 0 until this resolves.")
+        else:
+            st.info(f"No posts published in the last {WINDOW_DAYS} days, so every "
+                    f"post-derived metric below is 0 by definition. Account-level cards "
+                    f"(views, reach, engaged) still count activity on older posts and stories.")
     fu_by = (fu_totals.get("follows_and_unfollows") or {}).get("by", {})
     fu_total = total_of("follows_and_unfollows", fu_totals)
     new_follows_gross = sum(r["value"] for r in follower_series) if follower_series else None
@@ -1002,8 +1106,15 @@ with tab_overview:
                                "sum of daily follower_count values"))
     if fu_total or fu_by:
         breakdown_txt = " · ".join(f"{k.title()}: {fmt_int(v)}" for k, v in fu_by.items())
-        kpis.append(render_kpi("Follows & unfollows", fmt_int(fu_total),
-                               breakdown_txt or "as reported by Meta"))
+        if fu_total:
+            fu_display, fu_sub = fmt_int(fu_total), breakdown_txt or "as reported by Meta"
+        else:
+            # Meta returned breakdown rows but no combined total — showing 0
+            # would be a lie, so show a dash and let the breakdown speak.
+            fu_display = "—"
+            fu_sub = f"{breakdown_txt} (Meta returned no combined total; " \
+                     f"breakdown semantics undocumented)"
+        kpis.append(render_kpi("Follows & unfollows", fu_display, fu_sub))
     st.markdown(f'<div class="kpi-grid">{"".join(kpis)}</div>', unsafe_allow_html=True)
 
     # --- The v1 metric cells: same numbers, same formulas, always visible ---
