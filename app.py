@@ -1,7 +1,54 @@
 """
-Instagram Business Insights — Streamlit app (v4)
+Instagram Business Insights — Streamlit app (v6)
 Instagram API with Instagram Login only (graph.instagram.com / api.instagram.com).
 No Facebook Login, no graph.facebook.com anywhere in this file.
+
+WHAT CHANGED vs v5 — profile field coverage completed; a permission declined
+-----------------------------------------------------------------------------
+1. NOT added, on purpose: public_profile / "default public profile fields"
+   (graph-api/reference/user). That page is the FACEBOOK User node — it
+   requires a Facebook User access token via Facebook Login and returns the
+   Facebook person's name parts and picture. This app uses Business Login
+   for Instagram exclusively: there is no Facebook user, no Facebook token,
+   and no graph.facebook.com call anywhere, so that permission has no
+   exercise path here. It sits on virtually every Meta app by default,
+   which is why it appears "granted" in the App Dashboard. Wiring it in
+   would mean adding a second, unrelated login flow to fetch worse
+   duplicates of data already pulled from the IG profile.
+2. Added instead, under instagram_business_basic (already held): the one
+   IG User profile field the app wasn't fetching — `website` (link-in-bio
+   URL). Now fetched in fetch_profile, shown in the header, and the full
+   profile snapshot is dumped in Data -> Extended metrics so nothing
+   fetched is invisible. build_db_rows shapes remain byte-identical.
+
+WHAT CHANGED vs v4 — reach-variants diagnostic; verified default window
+------------------------------------------------------------------------
+1. VERIFIED on live data (2026-08-25): "Last N complete days" at UTC 0
+   reproduced the native app's Views EXACTLY (4,457 = 4,457). An exact
+   match on an additive metric pins the app's window convention: 30
+   complete days, today excluded, UTC midnights — so that mode is now the
+   DEFAULT. All three modes remain selectable; a stale-session guard
+   clears old widget state after the label rename.
+2. With identical windows, the remaining reach gap (API 2,135 vs the app's
+   "Viewers" 2,226) is measurement method, not dates. The API exposes no
+   "viewers" metric; reach is the closest analog and Meta documents it as
+   estimated. New diagnostic: reach is fetched FOUR ways for the same
+   window — with media_product_type breakdown (the headline), plain with
+   no breakdown (new fetch_reach_plain, +1 API call per load), with
+   follower-type breakdown (already fetched for the split), and the summed
+   daily series — all shown side by side in the Overview caption and the
+   Data-tab window debug. Whichever tracks the app's Viewers is what the
+   app uses; if none do, the residual is Meta-side and no parameter we
+   pass will close it.
+3. _parse_total_value_payload now records WHERE each total came from:
+   "meta_total" (Meta's own total_value.value) vs "breakdown_sum" (the
+   fallback that sums breakdown rows — which, for reach, double-counts
+   accounts appearing under more than one surface), or "mixed" across
+   chunks. Diagnostic only; no math consumes it.
+4. Deliberately UNCHANGED: the headline Reach KPI and the stored
+   total_reach_30d still come from the breakdown call, same as v2-v4. If
+   the variants show plain reach tracking the app's Viewers better, that
+   switch is a one-line change made on evidence — not another guess.
 
 WHAT CHANGED vs v3 — window convention is now selectable, nothing removed
 --------------------------------------------------------------------------
@@ -314,7 +361,7 @@ def fetch_identity(token: str) -> dict:
 def fetch_profile(token: str, ig_user_id: str) -> dict:
     data, err = api_get(
         ig_user_id, token,
-        fields=("account_type,biography,profile_picture_url,"
+        fields=("account_type,biography,website,profile_picture_url,"
                 "followers_count,follows_count,media_count"),
     )
     if err:
@@ -483,12 +530,17 @@ def fetch_media_extras(token: str, media_id: str, product_type: str) -> dict:
 
 
 def _parse_total_value_payload(data: dict) -> dict:
-    """-> {metric: {"total": int, "by": {DIMENSION: int}}}"""
+    """-> {metric: {"total": int, "by": {DIMENSION: int}, "source": str}}
+    "source" records where the total came from: "meta_total" = Meta's own
+    total_value.value; "breakdown_sum" = the fallback below, which for
+    reach DOUBLE-COUNTS accounts that appear under more than one breakdown
+    dimension (someone who saw both a reel and a post lands in both
+    buckets). Diagnostic only — nothing downstream uses it for math."""
     out: dict = {}
     for m in data.get("data", []):
         name = m.get("name")
         tv = m.get("total_value", {}) or {}
-        entry = {"total": tv.get("value", 0), "by": {}}
+        entry = {"total": tv.get("value", 0), "by": {}, "source": "meta_total"}
         for bd in tv.get("breakdowns", []) or []:
             for res in bd.get("results", []) or []:
                 dims = res.get("dimension_values", []) or ["?"]
@@ -497,20 +549,23 @@ def _parse_total_value_payload(data: dict) -> dict:
         # alongside a non-zero breakdown. Prefer the breakdown sum in that case.
         if not entry["total"] and entry["by"]:
             entry["total"] = sum(entry["by"].values())
+            entry["source"] = "breakdown_sum"
         out[name] = entry
     return out
 
 
-# Window alignment modes. Meta doesn't document which convention the native
-# app's "Last N days" uses, so it's selectable and testable:
-#   day_floor      — since floored to local midnight of (now − N days),
-#                    until = this exact instant. v3 behavior at tz 0.
+# Window alignment modes. Verified 2026-08-25: complete_days at UTC 0
+# reproduced the native app's Views exactly, so it leads the list (selectbox
+# index 0 = default). The UI expander is the source of truth for the active
+# mode; the per-function signature defaults are inert on the main path.
 #   complete_days  — last N complete local days: [midnight − N days, midnight
 #                    today]. Today's still-accumulating data excluded.
+#   day_floor      — since floored to local midnight of (now − N days),
+#                    until = this exact instant. v3 behavior at tz 0.
 #   rolling        — exact now − N days to now, to the second. v2 behavior.
 WINDOW_ALIGN_MODES = {
-    "Day-aligned days, incl. today (default)": "day_floor",
-    "Last N complete days (excl. today)": "complete_days",
+    "Last N complete days (excl. today) — matches the app (views verified)": "complete_days",
+    "Day-aligned days, incl. today": "day_floor",
     "Rolling — exact now − N days": "rolling",
 }
 
@@ -605,8 +660,10 @@ def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str]
         part = _totals_single(token, ig_user_id, metrics, since, until,
                               context, **extra)
         for name, entry in part.items():
-            slot = merged.setdefault(name, {"total": 0, "by": {}})
+            slot = merged.setdefault(name, {"total": 0, "by": {}, "source": None})
             slot["total"] += entry.get("total", 0)
+            src = entry.get("source", "meta_total")
+            slot["source"] = src if slot["source"] in (None, src) else "mixed"
             for k, v in (entry.get("by") or {}).items():
                 slot["by"][k] = slot["by"].get(k, 0) + v
     return merged
@@ -636,6 +693,21 @@ def fetch_account_totals_plain(token: str, ig_user_id: str, days: int,
         token, ig_user_id,
         ["accounts_engaged", "replies", "reposts", "profile_links_taps"],
         days, "account totals", align=align, tz_h=tz_h,
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_reach_plain(token: str, ig_user_id: str, days: int,
+                      align: str = "day_floor", tz_h: float = 0.0) -> dict:
+    """Account reach total_value with NO breakdown — the control arm of the
+    reach-variants diagnostic. Attaching a breakdown can change what Meta
+    returns as the top-level total, and the breakdown-sum fallback
+    double-counts cross-surface viewers, so this is the cleanest single
+    number the API offers for window-unique reach. One extra call per
+    load."""
+    return _totals_with_metric_dropping(
+        token, ig_user_id, ["reach"], days, "reach (no breakdown)",
+        align=align, tz_h=tz_h,
     )
 
 
@@ -1301,6 +1373,8 @@ else:  # older Streamlit fallback
 window_days = _picked or WINDOW_DAYS
 
 # --- Window alignment: which "last N days" convention to use -----------------
+if st.session_state.get("win_align") not in WINDOW_ALIGN_MODES:
+    st.session_state.pop("win_align", None)  # labels changed in v5 — drop stale state
 with st.expander("Window alignment — for matching the native app's date range"):
     _align_label = st.selectbox("Day boundary mode", list(WINDOW_ALIGN_MODES),
                                 index=0, key="win_align")
@@ -1310,10 +1384,11 @@ with st.expander("Window alignment — for matching the native app's date range"
                                help="Only moves where midnight falls for the day "
                                     "boundary; API timestamps stay correct either "
                                     "way. IST = 5.5")
-    st.caption("Instagram doesn't document which convention its own 'Last N days' "
-               "uses. Additive metrics (views, likes, interactions) move almost "
-               "linearly with window width, so try each mode against the app's "
-               "numbers; the queried range is shown in the summary line below.")
+    st.caption("Verified for this account: 'Last N complete days' at UTC 0 matched "
+               "the app's Views exactly, which pins the app's window convention — "
+               "hence it's the default. Additive metrics (views, likes, "
+               "interactions) move almost linearly with window width; the queried "
+               "range is shown in the summary line below.")
 win_align = WINDOW_ALIGN_MODES[_align_label]
 
 with st.spinner("Loading profile and account insights…"):
@@ -1339,6 +1414,8 @@ with st.spinner("Loading profile and account insights…"):
                                         win_align, win_tz_h)
     plr_totals = fetch_profile_links_taps_by_button(token, ig_user_id, window_days,
                                                     win_align, win_tz_h)
+    reach_plain = fetch_reach_plain(token, ig_user_id, window_days,
+                                    win_align, win_tz_h)
     reach_series = fetch_timeseries(token, ig_user_id, "reach", window_days,
                                     win_align, win_tz_h)
     follower_series = fetch_timeseries(token, ig_user_id, "follower_count",
@@ -1391,6 +1468,8 @@ with col_info:
                f"{fmt_int(profile.get('media_count', 0))} posts")
     if profile.get("biography"):
         st.caption(profile["biography"])
+    if profile.get("website"):
+        st.caption(f"🔗 {profile['website']}")
 with col_actions:
     if st.button("↻ Refresh data", use_container_width=True):
         st.cache_data.clear()
@@ -1484,23 +1563,25 @@ with tab_overview:
                   f" Note: computed over your selected {window_days}-day window even "
                   f"though the schema columns are named _30d."))
 
-    if _series_reach_sum is not None:
-        st.caption(
-            f"Reach cross-check — account total_value reach: "
-            f"{fmt_int(schema_metrics['total_reach_30d'])} vs. sum of the daily reach "
-            f"series for the same window: {fmt_int(_series_reach_sum)}. Meta documents "
-            f"daily reach as deduplicated within each day only, not across the window, "
-            f"so these are not expected to match — shown so you can compare both against "
-            f"what Instagram's own app reports for the same nominal period, rather than "
-            f"trusting either number blind. Views total_value for this window: "
-            f"{fmt_int(total_of('views', fmt_totals))} — views is additive, so it moves "
-            f"almost linearly with window width; if the app shows fewer views, the app's "
-            f"window is narrower than the one queried above (try the window-alignment "
-            f"expander at the top)."
-        )
-    else:
-        st.caption("Reach cross-check unavailable — the daily reach series returned no "
-                   "rows for this window.")
+    _reach_variants = {
+        "with content-type breakdown (headline)": total_of("reach", fmt_totals),
+        "plain, no breakdown": total_of("reach", reach_plain),
+        "with follower-type breakdown": (split_totals.get("reach") or {}).get("total", 0),
+        "sum of daily series": _series_reach_sum,
+    }
+    _variant_txt = " · ".join(
+        f"{k}: {fmt_int(v) if v is not None else '—'}"
+        for k, v in _reach_variants.items())
+    st.caption(
+        "Reach variants, all for the exact window above — " + _variant_txt + ". "
+        "Compare each against the app's Viewers number: views matching exactly "
+        "proves the window is identical, so any residual gap here is measurement "
+        "method, not dates. The API has no 'viewers' metric — reach is the closest "
+        "analog and Meta documents it as estimated. The daily-series sum "
+        "double-counts people seen on multiple days; a breakdown-sum fallback "
+        "double-counts across surfaces (per-variant sources are in Data → Window "
+        f"debug). Views total_value: {fmt_int(total_of('views', fmt_totals))}."
+    )
 
     # --- Profile link taps by button (new — was only a flat total before) ---
     _plt_by = (plr_totals.get("profile_links_taps") or {}).get("by", {})
@@ -1833,12 +1914,14 @@ with tab_data:
     st.markdown('<div class="section-eyebrow">Extended metrics (new — optional columns)</div>',
                 unsafe_allow_html=True)
     st.json({
+        "profile": profile,
         "reels_30d": reels_stats,
         "feed_30d": feed_stats,
         "account_totals_by_format": fmt_totals,
         "account_totals": plain_totals,
         "follows_and_unfollows": fu_totals,
         "profile_links_taps_by_button": plr_totals,
+        "reach_plain": reach_plain,
     })
 
     st.markdown('<div class="section-eyebrow">Window debug</div>', unsafe_allow_html=True)
@@ -1847,9 +1930,13 @@ with tab_data:
         "window_align_mode": win_align,
         "window_tz_offset_hours": win_tz_h,
         "window_queried": window_bounds_label(window_days, win_align, win_tz_h),
-        "reach_total_value": schema_metrics["total_reach_30d"],
-        "reach_series_sum": _series_reach_sum,
         "views_total_value": total_of("views", fmt_totals),
+        "reach_total_breakdown": total_of("reach", fmt_totals),
+        "reach_total_breakdown_source": (fmt_totals.get("reach") or {}).get("source"),
+        "reach_total_plain": total_of("reach", reach_plain),
+        "reach_total_plain_source": (reach_plain.get("reach") or {}).get("source"),
+        "reach_total_followtype": (split_totals.get("reach") or {}).get("total"),
+        "reach_series_sum": _series_reach_sum,
     })
 
     errs = st.session_state.get("api_errors", [])
