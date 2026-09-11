@@ -1,189 +1,75 @@
 """
-Instagram Business Insights — Streamlit app (v7)
+Instagram Business Insights — Streamlit app (v8)
 Instagram API with Instagram Login only (graph.instagram.com / api.instagram.com).
 No Facebook Login, no graph.facebook.com anywhere in this file.
 
-WHAT CHANGED vs v6 — inferred niche (category), since the API has none
------------------------------------------------------------------------
-1. The IG User node exposes NO category field on either login variant
-   (verified against the v25 reference), so the profile label ("Digital
-   creator" etc.) cannot be fetched. Added instead: infer_categories() — a
-   deterministic, keyword-based niche classifier over data the app already
-   pulls with the user's consent: biography, name, username, website, post
-   captions, and hashtags. Weighted scoring (profile text 3x, website and
-   hashtags 2x, captions 1x, capped per term), word-boundary matching for
-   plain words, substring matching for handle-glued terms like "d2c" in
-   "d2cwithgirish". Returns top categories with a share % and the matched
-   terms as evidence, or nothing when signal is too weak — it never
-   invents a label.
-2. Shown in the header ("Inferred niche … — top signals: …"), clearly
-   marked as a heuristic, and dumped in Data -> Extended metrics as
-   category_inferred. NOT added to build_db_rows — schema shapes stay
-   byte-identical; add a column downstream only if you want it.
-3. Deliberately NOT an LLM call: that would hard-code a model provider and
-   a new secret into a dashboard that currently needs only Meta
-   credentials, and add a paid failure mode to every page load. The
-   function is a marked seam — swap its body for a call to your own model
-   service and keep the return shape. For the marketplace itself,
-   self-declared category at onboarding still beats any inference.
-4. Taxonomy is a plain dict (CATEGORY_KEYWORDS) at module level — edit it
-   freely; English/Hinglish-leaning coverage, imperfect by design and
-   labeled as such.
-
-WHAT CHANGED vs v5 — profile field coverage completed; a permission declined
------------------------------------------------------------------------------
-1. NOT added, on purpose: public_profile / "default public profile fields"
-   (graph-api/reference/user). That page is the FACEBOOK User node — it
-   requires a Facebook User access token via Facebook Login and returns the
-   Facebook person's name parts and picture. This app uses Business Login
-   for Instagram exclusively: there is no Facebook user, no Facebook token,
-   and no graph.facebook.com call anywhere, so that permission has no
-   exercise path here. It sits on virtually every Meta app by default,
-   which is why it appears "granted" in the App Dashboard. Wiring it in
-   would mean adding a second, unrelated login flow to fetch worse
-   duplicates of data already pulled from the IG profile.
-2. Added instead, under instagram_business_basic (already held): the one
-   IG User profile field the app wasn't fetching — `website` (link-in-bio
-   URL). Now fetched in fetch_profile, shown in the header, and the full
-   profile snapshot is dumped in Data -> Extended metrics so nothing
-   fetched is invisible. build_db_rows shapes remain byte-identical.
-
-WHAT CHANGED vs v4 — reach-variants diagnostic; verified default window
-------------------------------------------------------------------------
-1. VERIFIED on live data (2026-08-25): "Last N complete days" at UTC 0
-   reproduced the native app's Views EXACTLY (4,457 = 4,457). An exact
-   match on an additive metric pins the app's window convention: 30
-   complete days, today excluded, UTC midnights — so that mode is now the
-   DEFAULT. All three modes remain selectable; a stale-session guard
-   clears old widget state after the label rename.
-2. With identical windows, the remaining reach gap (API 2,135 vs the app's
-   "Viewers" 2,226) is measurement method, not dates. The API exposes no
-   "viewers" metric; reach is the closest analog and Meta documents it as
-   estimated. New diagnostic: reach is fetched FOUR ways for the same
-   window — with media_product_type breakdown (the headline), plain with
-   no breakdown (new fetch_reach_plain, +1 API call per load), with
-   follower-type breakdown (already fetched for the split), and the summed
-   daily series — all shown side by side in the Overview caption and the
-   Data-tab window debug. Whichever tracks the app's Viewers is what the
-   app uses; if none do, the residual is Meta-side and no parameter we
-   pass will close it.
-3. _parse_total_value_payload now records WHERE each total came from:
-   "meta_total" (Meta's own total_value.value) vs "breakdown_sum" (the
-   fallback that sums breakdown rows — which, for reach, double-counts
-   accounts appearing under more than one surface), or "mixed" across
-   chunks. Diagnostic only; no math consumes it.
-4. Deliberately UNCHANGED: the headline Reach KPI and the stored
-   total_reach_30d still come from the breakdown call, same as v2-v4. If
-   the variants show plain reach tracking the app's Viewers better, that
-   switch is a one-line change made on evidence — not another guess.
-
-WHAT CHANGED vs v3 — window convention is now selectable, nothing removed
+WHAT CHANGED vs v7 — hard-blocking step-through OAuth UI (new; replaces the
+old auto-run st.status login sequence — everything else in v7 unchanged)
 --------------------------------------------------------------------------
-1. The day-boundary convention and its timezone are now UI controls (an
-   expander under the 7/30/90 selector): "Day-aligned incl. today" (the v3
-   behavior, still the default), "Last N complete days (excl. today)", or
-   "Rolling — exact now − N days" (the v2 behavior), plus an hours-vs-UTC
-   offset for where midnight falls (IST = 5.5). Every account-level
-   total_value call, both time series, AND the posts-in-window cutoff follow
-   the same convention, and the settings are part of every cache key, so
-   switching modes can't serve stale numbers.
-   WHY: v3's UTC day-flooring narrowed the reach gap vs the native app
-   (77 low -> 52 low) but pushed views ~51 HIGH — views is additive, so a
-   wider window reads strictly higher. That result is evidence the app's
-   own "Last 30 days" is narrower and/or aligned to a different midnight
-   (likely the account's local timezone). Meta doesn't document the app's
-   convention, so it's now empirically testable instead of guessed.
-2. The cross-check caption now includes the views total with a note that
-   views moves ~linearly with window width; the Data-tab window-debug JSON
-   now records the active mode, offset, and views total alongside reach.
-3. In "complete days" mode, posts published today are also excluded from
-   the post-based metrics (consistent window everywhere); in the other two
-   modes post handling is byte-identical to before.
+1. The Instagram Login flow this file implements is TWO token exchanges, not
+   three: (a) authorisation code -> short-lived token, (b) short-lived token
+   -> long-lived (~60 day) token. A third function, refresh_long_lived_token,
+   exists in section 3 but is never called on this path — it's for later,
+   once you persist tokens to a DB and refresh them after ~24h. Anything
+   describing "three tokens" for THIS flow is describing a step that doesn't
+   run; the step-through below only ever shows two calls because only two
+   calls happen.
+2. Login now proceeds as an explicit state machine in st.session_state
+   ("oauth_step": await_code -> run_step1 -> run_step2 -> done), so each
+   token exchange BLOCKS on a "Next" button click instead of both firing
+   back-to-back inside one st.status(...) the way v7 did. After each call,
+   the exact request (method, full URL, body) and the exact response body
+   Meta returned are shown on screen before the Next button appears — same
+   masking rule as the Sequential execution tab (access_token/client_secret
+   VALUES redacted, nothing else touched).
+3. New _render_call_detail() helper (section 6) does this rendering. It
+   pulls the just-made call straight off st.session_state.api_call_log[-1]
+   — the SAME entry the existing response hook (_log_api_call, section 2)
+   already recorded — rather than re-deriving or re-masking anything. That
+   keeps the login step-through and the Sequential execution tab showing
+   byte-identical data for the same two calls, by construction, not by
+   coincidence.
+4. The one-time `code` from Instagram's redirect is stashed in
+   st.session_state.oauth_code immediately (before query params are
+   cleared), because Streamlit reruns on every button click and a query
+   param does not survive that on its own. CSRF `state` verification is
+   unchanged from v7 and still happens before the code is ever used.
+5. Failure handling: if either exchange comes back without access_token,
+   the failing response is still shown in full (nothing is hidden on
+   error), and a "Restart login" button clears the OAuth state and returns
+   to the login link — it does not attempt to reuse a burned one-time code.
+6. Nothing else in the v7 file changed: the Sequential execution tab,
+   every fetcher, every metric formula, and every other tab are untouched.
 
-WHAT CHANGED vs v2 — nothing removed, all additive/corrective
----------------------------------------------------------------
-1. _chunk_ranges() now floors `since` to the start of its UTC day instead of
-   the exact instant the code ran. Every account-level total_value call goes
-   through this (reach, views, likes, comments, saves, shares,
-   total_interactions, accounts_engaged, replies, reposts,
-   profile_links_taps, follows_and_unfollows, the new
-   profile_links_taps-by-button call, and both time series) — so this shifts
-   MOST account-level numbers slightly, not just reach, and it shifts them
-   up (the window gets up to ~24h wider, never narrower). Rationale: reach
-   and friends are aggregated by whole days server-side; a `since` landing
-   mid-day risked Meta rounding away part of that first day, which is one
-   documented, named cause of API-vs-native-app number mismatches. This is a
-   reasoned improvement, not a confirmed fix — Meta doesn't publicly
-   document its own day-boundary/timezone convention for "last N days" in
-   the app, so treat this as the best available default and validate against
-   the app using the two additions below, not as a guarantee of an exact
-   match.
-2. window_bounds_label() + a caption in Overview surface the exact UTC
-   since/until every account-level call used, so you can compare it directly
-   against whatever date range Instagram's own app shows for its "last N
-   days" — the fastest way to confirm or rule out point 1 empirically.
-3. A visible reach cross-check in Overview + Data: account total_value reach
-   vs. the sum of the daily reach time-series for the same window. Meta
-   documents daily reach as deduplicated within each day only, not across
-   the window, so these are not expected to match — shown so you can see the
-   gap yourself instead of taking a comment's word for it. Two KPI sub-labels
-   that flatly asserted "sum of daily values" (unconfirmed) now point here
-   instead.
-4. Two more insights extracted, previously available but unused:
-     - Media-level `profile_activity`, broken down by action_type (bio-link
-       tap, call, email, direction, text) — what someone did after visiting
-       your profile from a specific post. Distinct from profile_visits,
-       which only says a visit happened. New: Feed tab KPI + breakdown bars,
-       a post-card chip, a "Top content" rank-by option, and a column in the
-       feed data table.
-     - Account-level `profile_links_taps`, now also fetched WITH its
-       contact_button_type breakdown (call/email/direction/text/book-now),
-       alongside the existing flat total — new breakdown bars in Overview.
-   Cost: one extra API call per feed post during per-post enrichment
-   (profile_activity needs its own call — Meta errors a batched request if
-   one metric in it doesn't support the requested breakdown). Feed-heavy
-   accounts near MAX_ENRICHED_MEDIA will feel this; nothing else changed
-   about that cap.
+(v7 and earlier changelog entries retained below for full history.)
 
-WHAT CHANGED vs v1 (audit summary)
-----------------------------------
-1. SCOPES trimmed to the TWO permissions your app actually holds:
-       instagram_business_basic
-       instagram_business_manage_insights
-   v1 requested five (messages / comments / content_publish included). Asking
-   for scopes your app doesn't have kills the authorize step before your code
-   ever runs. Nothing in this file ever used those endpoints anyway.
-
-2. Reels and Feed are now SEPARATE everywhere: per-post metrics are split by
-   media_product_type, and account-level reach/views/interactions are fetched
-   with breakdown=media_product_type so you get Meta's own REELS vs FEED vs
-   STORY split — not a hand-rolled sum of posts.
-
-3. Granted-but-unused insights now implemented (all covered by your two scopes):
-   Account:  views, accounts_engaged, likes/comments/saves/shares/replies/
-             reposts totals, profile_links_taps, follows_and_unfollows,
-             reach time-series, follower_count time-series, online_followers,
-             follower_demographics, engaged_audience_demographics
-   Media:    reposts (all), and per-type extras —
-             REELS: ig_reels_avg_watch_time, ig_reels_video_view_total_time,
-                    reels_skip_rate
-             FEED:  follows (followers gained from a post), profile_visits
-
-4. Formula upgrades: median-based per-post ER (robust to one viral outlier),
-   rate decomposition (save/share/comment rate per reach), views-per-reach
-   (rewatch signal), reach rate vs followers, reels hook rate (100 − skip
-   rate), feed follow-conversion. The five columns your schema stores are
-   unchanged; everything new lives in a separate "extended" dict.
-
-5. Corrected an overclaim from v1: account reach total_value was labeled
-   "deduplicated across 30 days". Meta's response docs describe total_value
-   as the SUM of the period's values, so cross-day dedup is NOT guaranteed.
-   Labels now say what the number actually is.
-
-6. Hardening: shared session, one error path for every call, OAuth `state`
-   CSRF check, retry-that-drops-unavailable-metrics (several account metrics
-   are flagged "in development" by Meta and can vanish per-account), warning
-   if the redirect URI has a path (Streamlit only serves the root URL).
+WHAT CHANGED vs v7(orig) — sequential execution log (new tab, purely additive)
+--------------------------------------------------------------------------
+1. New "Sequential execution" tab: every network call this file makes, in
+   the order it actually happened, starting with the OAuth token exchange.
+   Per call — method, full endpoint, HTTP status, response time, and the
+   COMPLETE response body exactly as Meta returned it (not the filtered /
+   computed values the rest of the app derives from it). Plus a running
+   call count, a per-endpoint breakdown, a Clear-log button, and a JSON
+   download of the whole log.
+2. Implementation is a single `requests` response hook attached to the
+   existing shared SESSION object (see "Sequential API call log" in
+   section 2, directly above _record_error). A hook observes each response
+   after it arrives and, by returning None, hands it back completely
+   unchanged — so this doesn't alter what any existing function does,
+   receives, or returns; it only watches. Because every call in this file —
+   the OAuth calls in section 3 included — goes through this one SESSION,
+   one hook sees all of it.
+3. One deliberate exception to "complete, unfiltered": access_token and
+   client_secret VALUES are masked (prefix/suffix + length shown) wherever
+   they appear, in requests and in responses (the two OAuth-exchange
+   responses return the token as their payload). Reasoning, and how to
+   remove this if you want raw values instead: see the comment block above
+   _log_api_call.
+4. The only touch points in previously-existing code: one new stdlib
+   import (json, for the download button) and the st.tabs([...]) call
+   gained a sixth tab. No existing function body, return value, cache key,
+   formula, or call site changed. No new pip dependency, no new env var.
 
 ENV VARS REQUIRED (Streamlit Cloud -> Settings -> Secrets, or local .env):
     INSTA_APP_ID        Instagram app Client ID
@@ -200,6 +86,7 @@ Dependencies: streamlit>=1.41, requests, python-dotenv
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import secrets as pysecrets
@@ -266,6 +153,68 @@ SESSION = requests.Session()
 # ---------------------------------------------------------------------------
 # 2. HTTP CORE — one request path, one error shape
 # ---------------------------------------------------------------------------
+
+_SECRET_KEYS = ("access_token", "client_secret")
+
+
+def _mask_secret(value: str) -> str:
+    if len(value) <= 10:
+        return "***REDACTED***"
+    return f"{value[:6]}…{value[-4:]} (redacted, {len(value)} chars)"
+
+
+def _redact_secrets(text) -> str:
+    """Masks only access_token / client_secret VALUES — as URL/form params
+    (key=value) or JSON fields ("key": "value") — everywhere they occur.
+    Every other byte of the request or response is left exactly as-is."""
+    if not text:
+        return text or ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    for key in _SECRET_KEYS:
+        text = re.sub(rf"({key}=)([^&\s\"]+)",
+                      lambda m: m.group(1) + _mask_secret(m.group(2)), text)
+        text = re.sub(rf'("{key}"\s*:\s*")([^"]+)(")',
+                      lambda m: m.group(1) + _mask_secret(m.group(2)) + m.group(3), text)
+    return text
+
+
+def _endpoint_key(url: str) -> str:
+    """Collapses a full URL to a stable shape for the 'how many times / which
+    endpoint' summary — drops the query string and folds Instagram's long
+    numeric IDs to '{id}' so e.g. every .../insights call for every media ID
+    counts as one endpoint family. The exact full URL is still kept per-call
+    for the detail view; this is only for the grouped counts."""
+    path = url.split("?", 1)[0]
+    return re.sub(r"/\d{6,}", "/{id}", path)
+
+
+def _log_api_call(response, *args, **kwargs) -> None:
+    """requests 'response' hook — fires once per completed HTTP response on
+    SESSION, for every call this file makes. Falling off the end (returning
+    None) leaves the response requests hands back to the calling code
+    completely unmodified; this function only ever reads it."""
+    req = response.request
+    body = req.body
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    entry = {
+        "seq": len(st.session_state.get("api_call_log", [])) + 1,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z",
+        "method": req.method,
+        "url": _redact_secrets(req.url),
+        "endpoint": _endpoint_key(req.url),
+        "request_body": _redact_secrets(body) if body else "",
+        "status_code": response.status_code,
+        "elapsed_ms": round(response.elapsed.total_seconds() * 1000, 1),
+        "response_text": _redact_secrets(response.text),
+        "response_headers": dict(response.headers),
+    }
+    st.session_state.setdefault("api_call_log", []).append(entry)
+
+
+SESSION.hooks.setdefault("response", []).append(_log_api_call)
+
 
 def _record_error(context: str, err: dict) -> None:
     st.session_state.setdefault("api_errors", []).append(
@@ -361,7 +310,9 @@ def exchange_for_long_lived_token(short_token: str) -> dict:
 def refresh_long_lived_token(token: str) -> dict:
     """Long-lived tokens last ~60 days and can be refreshed after 24h.
     Not called automatically here (token lives only in session_state);
-    wire this in once you persist tokens to your DB."""
+    wire this in once you persist tokens to your DB. This is the ONLY
+    other token-related call this file defines — it does not run as part
+    of the login step-through because login never needs it."""
     resp = SESSION.get(
         f"{GRAPH_HOST}/refresh_access_token",
         params={"grant_type": "ig_refresh_token", "access_token": token},
@@ -438,23 +389,7 @@ def _parse_ig_timestamp(raw: str) -> datetime | None:
 def fetch_media_window(token: str, ig_user_id: str, days: int,
                        align: str = "day_floor", tz_h: float = 0.0) -> list[dict]:
     """All media published inside the selected window, with the common
-    insight set attached. The window bounds come from _chunk_ranges() with
-    the SAME align/tz convention as the account totals, so "posts in
-    window" and "account totals window" can't silently diverge. The upper
-    bound only bites in complete-days mode (today's posts drop out along
-    with today's totals); in day-aligned and rolling modes it equals "now",
-    which changes nothing versus before.
-
-    Resilience: if the insights field expansion makes the whole /media call
-    fail (Meta rejects the entire request when one expanded metric is
-    unavailable), retry WITHOUT the expansion and fetch each post's insights
-    individually. A failed expansion must never masquerade as '0 posts'.
-
-    Ordering: does NOT assume strict newest-first (pinned posts could break
-    that). Items are filtered by timestamp; pagination stops only when an
-    entire page falls entirely OLDER than the window. If items came back but
-    none landed in the window, a diagnostic is recorded instead of a silent
-    zero."""
+    insight set attached."""
     _ranges = _chunk_ranges(days, align=align, tz_h=tz_h)
     cutoff = datetime.fromtimestamp(_ranges[0][0], tz=timezone.utc)
     upper = datetime.fromtimestamp(_ranges[-1][1], tz=timezone.utc)
@@ -480,11 +415,11 @@ def fetch_media_window(token: str, ig_user_id: str, days: int,
                 skipped_parse += 1
                 continue
             if ts >= cutoff:
-                page_has_recent = True  # not yet older than the window
+                page_has_recent = True
                 if ts < upper:
                     posts.append(post)
         if page and not page_has_recent:
-            break  # whole page older than the window — done
+            break
         next_url = data.get("paging", {}).get("next")
         if not next_url:
             break
@@ -503,19 +438,7 @@ def fetch_media_window(token: str, ig_user_id: str, days: int,
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_media_extras(token: str, media_id: str, product_type: str) -> dict:
-    """Type-specific per-media insights. REELS: watch time + skip rate (one
-    call, unchanged). FEED: follows + profile_visits, PLUS profile_activity
-    broken down by action_type — what someone did after visiting your
-    profile from this post (bio-link tap, call, email, direction, text),
-    which is a different signal than profile_visits (a visit happened) or
-    follows (they followed). profile_activity needs a separate call: it's
-    the only metric here that takes a breakdown, and Meta errors the whole
-    request if one metric in a batch doesn't support the breakdown given to
-    it. The two FEED calls are independent, so one failing still returns
-    whatever the other got — strictly more resilient than a single
-    all-or-nothing call. Returns {} keys are simply omitted on error (some
-    metrics are flagged 'in development' by Meta and can be absent per
-    account)."""
+    """Type-specific per-media insights."""
     if product_type == "REELS":
         data, err = api_get(f"{media_id}/insights", token, metric=REELS_EXTRA_METRICS)
         if err:
@@ -558,12 +481,6 @@ def fetch_media_extras(token: str, media_id: str, product_type: str) -> dict:
 
 
 def _parse_total_value_payload(data: dict) -> dict:
-    """-> {metric: {"total": int, "by": {DIMENSION: int}, "source": str}}
-    "source" records where the total came from: "meta_total" = Meta's own
-    total_value.value; "breakdown_sum" = the fallback below, which for
-    reach DOUBLE-COUNTS accounts that appear under more than one breakdown
-    dimension (someone who saw both a reel and a post lands in both
-    buckets). Diagnostic only — nothing downstream uses it for math."""
     out: dict = {}
     for m in data.get("data", []):
         name = m.get("name")
@@ -573,8 +490,6 @@ def _parse_total_value_payload(data: dict) -> dict:
             for res in bd.get("results", []) or []:
                 dims = res.get("dimension_values", []) or ["?"]
                 entry["by"][dims[-1]] = entry["by"].get(dims[-1], 0) + res.get("value", 0)
-        # Meta omits the top-level value on some breakdown responses -> 0 total
-        # alongside a non-zero breakdown. Prefer the breakdown sum in that case.
         if not entry["total"] and entry["by"]:
             entry["total"] = sum(entry["by"].values())
             entry["source"] = "breakdown_sum"
@@ -582,15 +497,6 @@ def _parse_total_value_payload(data: dict) -> dict:
     return out
 
 
-# Window alignment modes. Verified 2026-08-25: complete_days at UTC 0
-# reproduced the native app's Views exactly, so it leads the list (selectbox
-# index 0 = default). The UI expander is the source of truth for the active
-# mode; the per-function signature defaults are inert on the main path.
-#   complete_days  — last N complete local days: [midnight − N days, midnight
-#                    today]. Today's still-accumulating data excluded.
-#   day_floor      — since floored to local midnight of (now − N days),
-#                    until = this exact instant. v3 behavior at tz 0.
-#   rolling        — exact now − N days to now, to the second. v2 behavior.
 WINDOW_ALIGN_MODES = {
     "Last N complete days (excl. today) — matches the app (views verified)": "complete_days",
     "Day-aligned days, incl. today": "day_floor",
@@ -600,18 +506,6 @@ WINDOW_ALIGN_MODES = {
 
 def _chunk_ranges(days: int, max_span: int = 30, align: str = "day_floor",
                   tz_h: float = 0.0) -> list[tuple[int, int]]:
-    """Split the window into <=max_span-day (since, until) unix pairs — Meta
-    serves short insight ranges, so 90d becomes three 30d calls.
-
-    `align` and `tz_h` pick the window convention (see WINDOW_ALIGN_MODES).
-    Rationale: reach/views/interactions are aggregated by whole days
-    server-side, and additive metrics move almost linearly with window
-    width — so WHERE the boundary falls, and in WHICH timezone, is exactly
-    what decides whether these totals line up with the native app's
-    "Last N days". Meta doesn't publish the app's convention; use the UI
-    expander + window_bounds_label() to find the one that matches instead
-    of trusting any single guess. Unix timestamps are timezone-correct
-    regardless of tz_h (aware datetimes)."""
     tz = timezone(timedelta(hours=tz_h))
     now = datetime.now(tz)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -634,9 +528,6 @@ def _chunk_ranges(days: int, max_span: int = 30, align: str = "day_floor",
 
 def window_bounds_label(days: int, align: str = "day_floor",
                         tz_h: float = 0.0) -> str:
-    """Human-readable (since, until) for the full window, rendered in the
-    chosen boundary timezone — for comparing against whatever date range
-    Instagram's app shows for the same nominal 'last N days' period."""
     ranges = _chunk_ranges(days, align=align, tz_h=tz_h)
     if not ranges:
         return "—"
@@ -649,9 +540,6 @@ def window_bounds_label(days: int, align: str = "day_floor",
 
 def _totals_single(token: str, ig_user_id: str, metrics: list[str],
                    since: int, until: int, context: str, **extra) -> dict:
-    """One since/until range. Meta 400s the WHOLE call if one metric is
-    unavailable for this account or was deprecated since this file was
-    written. Drop the offending metric (when the error names it) and retry."""
     remaining = list(metrics)
     for _ in range(4):
         if not remaining:
@@ -678,11 +566,6 @@ def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str]
                                  days: int, context: str, *,
                                  align: str = "day_floor", tz_h: float = 0.0,
                                  **extra) -> dict:
-    """Window totals, chunked into <=30d ranges and summed. Additive metrics
-    (views, likes, interactions…) sum exactly; reach sums each chunk's value,
-    consistent with the sum-of-daily-values caveat used everywhere else.
-    align/tz_h are keyword-only so they can never fall into **extra and leak
-    into the API query string."""
     merged: dict = {}
     for since, until in _chunk_ranges(days, align=align, tz_h=tz_h):
         part = _totals_single(token, ig_user_id, metrics, since, until,
@@ -701,9 +584,6 @@ def _totals_with_metric_dropping(token: str, ig_user_id: str, metrics: list[str]
 def fetch_account_totals_by_format(token: str, ig_user_id: str, days: int,
                                    align: str = "day_floor",
                                    tz_h: float = 0.0) -> dict:
-    """Account totals WITH breakdown=media_product_type — Meta's own
-    REELS vs FEED vs STORY vs AD split. All listed metrics support this
-    breakdown per the IG User Insights reference."""
     return _totals_with_metric_dropping(
         token, ig_user_id,
         ["reach", "views", "likes", "comments", "saves", "shares", "total_interactions"],
@@ -716,7 +596,6 @@ def fetch_account_totals_by_format(token: str, ig_user_id: str, days: int,
 def fetch_account_totals_plain(token: str, ig_user_id: str, days: int,
                                align: str = "day_floor",
                                tz_h: float = 0.0) -> dict:
-    """Metrics that don't take the media_product_type breakdown."""
     return _totals_with_metric_dropping(
         token, ig_user_id,
         ["accounts_engaged", "replies", "reposts", "profile_links_taps"],
@@ -727,12 +606,6 @@ def fetch_account_totals_plain(token: str, ig_user_id: str, days: int,
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_reach_plain(token: str, ig_user_id: str, days: int,
                       align: str = "day_floor", tz_h: float = 0.0) -> dict:
-    """Account reach total_value with NO breakdown — the control arm of the
-    reach-variants diagnostic. Attaching a breakdown can change what Meta
-    returns as the top-level total, and the breakdown-sum fallback
-    double-counts cross-surface viewers, so this is the cleanest single
-    number the API offers for window-unique reach. One extra call per
-    load."""
     return _totals_with_metric_dropping(
         token, ig_user_id, ["reach"], days, "reach (no breakdown)",
         align=align, tz_h=tz_h,
@@ -743,12 +616,6 @@ def fetch_reach_plain(token: str, ig_user_id: str, days: int,
 def fetch_profile_links_taps_by_button(token: str, ig_user_id: str, days: int,
                                        align: str = "day_floor",
                                        tz_h: float = 0.0) -> dict:
-    """profile_links_taps broken down by contact_button_type (call, email,
-    direction, text, book-now, instant-experience) — which specific button
-    people tap, not just the combined total already covered by
-    fetch_account_totals_plain. Separate call: accounts_engaged/replies/
-    reposts in that batch don't support this breakdown, so it can't ride
-    along with them."""
     return _totals_with_metric_dropping(
         token, ig_user_id, ["profile_links_taps"], days,
         "profile links taps by button", align=align, tz_h=tz_h,
@@ -760,8 +627,6 @@ def fetch_profile_links_taps_by_button(token: str, ig_user_id: str, days: int,
 def fetch_follows_unfollows(token: str, ig_user_id: str, days: int,
                             align: str = "day_floor",
                             tz_h: float = 0.0) -> dict:
-    """follows_and_unfollows with breakdown=follow_type. Requires >=100
-    followers; returns {} below that."""
     return _totals_with_metric_dropping(
         token, ig_user_id, ["follows_and_unfollows"], days,
         "follows/unfollows", align=align, tz_h=tz_h, breakdown="follow_type",
@@ -771,11 +636,6 @@ def fetch_follows_unfollows(token: str, ig_user_id: str, days: int,
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_follower_split(token: str, ig_user_id: str, days: int,
                          align: str = "day_floor", tz_h: float = 0.0) -> dict:
-    """Followers vs non-followers split for views / reach / interactions —
-    what Instagram's native 'Account insights' shows as 30.3% / 69.7%.
-    Meta's docs name this breakdown inconsistently (follower_type for views,
-    follow_type for reach), so both spellings are tried per metric; metrics
-    that reject both are simply absent from the result."""
     out: dict = {}
     for metric in ("views", "reach", "total_interactions"):
         for bd in ("follower_type", "follow_type"):
@@ -792,11 +652,6 @@ def fetch_follower_split(token: str, ig_user_id: str, days: int,
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_timeseries(token: str, ig_user_id: str, metric: str, days: int,
                      align: str = "day_floor", tz_h: float = 0.0) -> list[dict]:
-    """Daily time series -> [{"date": ..., "value": ...}], chunked into <=30d
-    calls for longer windows. follower_count needs >=100 followers and Meta
-    serves only ~30 days of it — older chunks fail quietly into the log.
-    Uses the same window convention as the totals, so the reach cross-check
-    compares like for like."""
     out: list[dict] = []
     for since, until in _chunk_ranges(days, align=align, tz_h=tz_h):
         data, err = api_get(
@@ -819,9 +674,6 @@ def fetch_timeseries(token: str, ig_user_id: str, metric: str, days: int,
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_online_followers_raw(token: str, ig_user_id: str) -> list[tuple[str, dict]]:
-    """Per-day hour buckets for the last ~30 days (Meta's limit) ->
-    [(YYYY-MM-DD, {hour_str: count})]. Requires >=100 followers.
-    Kept per-day so the UI can filter by weekday like the native app."""
     data, err = api_get(
         f"{ig_user_id}/insights", token,
         metric="online_followers", period="lifetime",
@@ -841,10 +693,6 @@ def fetch_online_followers_raw(token: str, ig_user_id: str) -> list[tuple[str, d
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fetch_demographics(token: str, ig_user_id: str, metric: str,
                        breakdown: str, timeframe: str) -> list[tuple[str, int]]:
-    """follower_demographics / engaged_audience_demographics.
-    timeframe must be this_month or this_week on v20+ (older values were
-    removed). Needs >=100 followers (or >=100 engagements for the engaged
-    metric); Meta returns only the top 45 rows."""
     data, err = api_get(
         f"{ig_user_id}/insights", token,
         metric=metric, period="lifetime", timeframe=timeframe,
@@ -868,11 +716,6 @@ def fetch_demographics(token: str, ig_user_id: str, metric: str,
 # 5. METRICS
 # ---------------------------------------------------------------------------
 
-# Niche taxonomy for infer_categories(). Plain data on purpose — edit freely.
-# All terms lowercase. Multi-word terms match as substrings; single words
-# match on word boundaries (so "art" never fires inside "start"); terms with
-# digits or length >= 4 also substring-match inside handles, URLs, and
-# hashtags (so "d2c" fires inside "d2cwithgirish").
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "D2C & E-commerce": ["d2c", "ecommerce", "e-commerce", "shopify", "dropshipping",
                          "online store", "amazon", "flipkart", "meesho",
@@ -919,12 +762,11 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
                                "lifestyle"],
 }
 
-CATEGORY_MIN_SCORE = 4.0     # below this, infer_categories() reports nothing
-_CAPTION_TERM_CAP = 5        # a term counts at most this many captions
+CATEGORY_MIN_SCORE = 4.0
+_CAPTION_TERM_CAP = 5
 
 
 def _match_terms_text(text: str, terms: list[str]) -> set[str]:
-    """Word-boundary matching for plain prose (bio, captions)."""
     found = set()
     for t in terms:
         t_ = t.strip()
@@ -937,10 +779,6 @@ def _match_terms_text(text: str, terms: list[str]) -> set[str]:
 
 
 def _match_terms_glued(text: str, terms: list[str]) -> set[str]:
-    """Substring matching for handles, URLs, and hashtags, where words glue
-    together ('d2cwithgirish', '#performancemarketing'). Only terms that are
-    multi-word, contain a digit, or are >= 4 chars qualify — short generic
-    words like 'ai' or 'art' would false-positive inside random strings."""
     found = set()
     squashed = text.replace(" ", "")
     for t in terms:
@@ -953,16 +791,6 @@ def _match_terms_glued(text: str, terms: list[str]) -> set[str]:
 
 def infer_categories(profile: dict, identity: dict, posts: list[dict],
                      top_n: int = 3) -> list[dict]:
-    """Deterministic niche inference from data the app already pulls with
-    consent: bio + name + username (weight 3), website + hashtags (weight 2),
-    caption prose (weight 1, capped per term). Returns up to top_n dicts
-    {category, score, share_pct, evidence} sorted by score, or [] when the
-    best score is under CATEGORY_MIN_SCORE — no label is better than a
-    made-up one.
-
-    UPGRADE SEAM: to switch to model-based classification, replace this
-    body with a call to your own model service and keep the return shape;
-    everything downstream (header caption, Data-tab JSON) stays valid."""
     prof_text = " ".join(str(x or "") for x in (
         profile.get("biography"), identity.get("name"))).lower()
     glued_text = " ".join(str(x or "") for x in (
@@ -1022,9 +850,6 @@ def _median(xs: list[float]) -> float:
 
 def group_stats(posts: list[dict], followers: int,
                 extras: dict[str, dict]) -> dict:
-    """Per-format metric block. Median-based ER is the headline: with a
-    typical 30-day sample one viral post drags any mean; the median is what
-    a *typical* post did."""
     n = len(posts)
     sums = {k: 0 for k in ["views", "reach", "saved", "shares", "reposts",
                             "interactions", "likes", "comments"]}
@@ -1051,8 +876,6 @@ def group_stats(posts: list[dict], followers: int,
             if followers:
                 reach_rates.append(reach / followers * 100)
         ex = extras.get(p.get("id", ""), {})
-        # ig_reels_* watch times arrive in MILLISECONDS (not in Meta's docs;
-        # widely confirmed by third-party integrations) — converted here.
         if "ig_reels_avg_watch_time" in ex:
             watch_avgs_s.append(ex["ig_reels_avg_watch_time"] / 1000.0)
         if "ig_reels_video_view_total_time" in ex:
@@ -1075,7 +898,7 @@ def group_stats(posts: list[dict], followers: int,
         **sums,
         "er_reach_median": _median(er_rates),
         "er_reach_mean": round(sum(er_rates) / len(er_rates), 2) if er_rates else 0.0,
-        "reach_rate_median": _median(reach_rates),      # % of followers a typical post reaches
+        "reach_rate_median": _median(reach_rates),
         "save_rate": rate(sums["saved"]),
         "share_rate": rate(sums["shares"]),
         "comment_rate": rate(sums["comments"]),
@@ -1090,7 +913,7 @@ def group_stats(posts: list[dict], followers: int,
     if follows_sum or visits_sum:
         out["follows_from_posts"] = follows_sum
         out["profile_visits_from_posts"] = visits_sum
-        out["follow_conversion"] = rate(follows_sum)     # follows per 100 reached
+        out["follow_conversion"] = rate(follows_sum)
     if profile_activity_sum:
         out["profile_activity_from_posts"] = profile_activity_sum
     if profile_activity_by_action:
@@ -1100,11 +923,6 @@ def group_stats(posts: list[dict], followers: int,
 
 def compute_schema_metrics(posts: list[dict], followers: int,
                            account_totals: dict) -> dict:
-    """The five columns your schema stores — definitions unchanged from v1,
-    labels corrected. Account reach here is Meta's total_value for the
-    window; Meta documents total_value as the sum of the period's values, so
-    treat it as Meta's reported window total, NOT guaranteed cross-day
-    unique."""
     n = len(posts)
     likes_sum = sum(p.get("like_count", 0) or 0 for p in posts)
     inter_sum = sum(_post_insight_value(p, "total_interactions") for p in posts)
@@ -1125,9 +943,6 @@ def compute_schema_metrics(posts: list[dict], followers: int,
 
 
 def compute_industry_engagement_rate(posts: list[dict], followers: int) -> float:
-    """(avg likes + avg comments per post) / followers x 100 — the per-post
-    averaged formula most third-party IG tools display as 'Engagement Rate'.
-    Kept for cross-tool comparison; your schema stores the cumulative ones."""
     if not posts or not followers:
         return 0.0
     avg_likes = sum(p.get("like_count", 0) or 0 for p in posts) / len(posts)
@@ -1150,9 +965,6 @@ def rank_top_posts(posts: list[dict], n: int = TOP_N_POSTS) -> list[dict]:
 
 
 def build_db_rows(identity, profile, token_meta, schema_metrics) -> dict:
-    """Unchanged shape — matches your social_accounts / instagram_accounts /
-    metrics column names exactly. New metrics are returned separately as
-    metrics_extended_30d; add columns for those only if you want them."""
     return {
         "social_accounts": {
             "platform_user_id": identity.get("id"),
@@ -1303,9 +1115,6 @@ _MEDIA_LABELS = {"REELS": "Reel", "VIDEO": "Video", "CAROUSEL_ALBUM": "Carousel"
 
 
 def _compact_html(s: str) -> str:
-    """Markdown ends an HTML block at a blank line and renders 4-space-indented
-    text as a code block — so multi-line HTML with indentation leaks raw source
-    into the page from the second element onward. Collapse to one line."""
     return "".join(line.strip() for line in s.splitlines() if line.strip())
 
 
@@ -1313,7 +1122,6 @@ _FORMAT_LABELS = {"REELS": "Reels", "FEED": "Posts", "STORY": "Stories", "AD": "
 
 
 def render_pct_block(title: str, by: dict, sub: str = "") -> str:
-    """Native-style 'By content type' percentage bars from a breakdown map."""
     total = sum(v for v in by.values() if v)
     if not total:
         return ""
@@ -1335,8 +1143,6 @@ def render_pct_block(title: str, by: dict, sub: str = "") -> str:
 
 
 def follower_split_line(metric_label: str, entry: dict) -> str | None:
-    """'Views — Followers 30.3% · Non-followers 69.7%' from a follower-type
-    breakdown. Labels come straight from Meta; nothing is renamed."""
     by = (entry or {}).get("by") or {}
     total = sum(v for v in by.values() if v)
     if not total:
@@ -1442,6 +1248,34 @@ def bar_chart(rows: list[dict], x_field: str, x_title: str, value_label: str,
         tooltip=[x_field, "value"])
 
 
+def _render_call_detail(entry: dict) -> None:
+    """Shared by the login step-through and can be reused anywhere else a
+    single logged call needs showing. Pulls straight from an entry produced
+    by _log_api_call (section 2) — same masking, same fields, no re-derivation."""
+    st.caption(f"{entry['method']} · {entry['endpoint']} · "
+               f"HTTP {entry['status_code']} · {entry['elapsed_ms']} ms · {entry['ts']}")
+    st.text_input("Request URL", entry["url"], disabled=True, key=f"oauth_url_{entry['seq']}")
+    if entry["request_body"]:
+        st.text_area("Request body", entry["request_body"], disabled=True,
+                     height=80, key=f"oauth_body_{entry['seq']}")
+    st.markdown("**Response body — exactly as Meta sent it (secrets masked)**")
+    try:
+        st.json(json.loads(entry["response_text"]))
+    except (ValueError, TypeError):
+        st.code(entry["response_text"] or "(empty body)")
+
+
+def _latest_log_entry() -> dict | None:
+    log = st.session_state.get("api_call_log", [])
+    return log[-1] if log else None
+
+
+def _reset_oauth_state() -> None:
+    for k in ("oauth_step", "oauth_code", "oauth_short_result",
+              "oauth_long_result", "oauth_state"):
+        st.session_state.pop(k, None)
+
+
 # ---------------------------------------------------------------------------
 # 7. STREAMLIT APP
 # ---------------------------------------------------------------------------
@@ -1466,57 +1300,105 @@ if _redirect_path not in ("", "/"):
         f"matching that path. Recommended: register and use the root URL."
     )
 
-# --- OAuth gate -------------------------------------------------------------
+# --- OAuth gate — hard-blocking two-step exchange, one Next click each ------
 if "access_token" not in st.session_state:
     st.title("📊 Instagram Business Insights")
     st.caption(f"Redirect URI in use: `{REDIRECT_URI}` — must match the Meta App "
                f"Dashboard registration character for character.")
-    code = st.query_params.get("code")
-    returned_state = st.query_params.get("state")
 
-    if not code:
-        st.session_state.oauth_state = pysecrets.token_urlsafe(16)
-        st.info("Connect an Instagram professional account to see its insights — "
-                "7 / 30 / 90-day windows, account totals, Reels and Feed "
-                "separated, audience data, and best posting hours.")
-        st.link_button("Log in with Instagram",
-                       build_authorize_url(st.session_state.oauth_state),
-                       use_container_width=True)
-        st.stop()
+    st.session_state.setdefault("oauth_step", "await_code")
 
-    expected_state = st.session_state.get("oauth_state")
-    if returned_state and expected_state and returned_state != expected_state:
+    # --- await_code: no API call yet, just the login link or a fresh redirect ---
+    if st.session_state.oauth_step == "await_code":
+        code = st.query_params.get("code")
+        returned_state = st.query_params.get("state")
+
+        if not code:
+            st.session_state.oauth_state = pysecrets.token_urlsafe(16)
+            st.info("Connect an Instagram professional account to see its insights — "
+                    "7 / 30 / 90-day windows, account totals, Reels and Feed "
+                    "separated, audience data, and best posting hours.")
+            st.link_button("Log in with Instagram",
+                           build_authorize_url(st.session_state.oauth_state),
+                           use_container_width=True)
+            st.stop()
+
+        expected_state = st.session_state.get("oauth_state")
+        if returned_state and expected_state and returned_state != expected_state:
+            st.query_params.clear()
+            st.error("Login state mismatch (possible CSRF or a stale login tab). "
+                     "Start the login again.")
+            if st.button("Restart login"):
+                _reset_oauth_state()
+                st.rerun()
+            st.stop()
+
+        # Stash the one-time code before clearing the URL — it won't survive
+        # the reruns the Next buttons below trigger, and it can only be used once.
+        st.session_state.oauth_code = code
         st.query_params.clear()
-        st.error("Login state mismatch (possible CSRF or a stale login tab). "
-                 "Start the login again.")
-        if st.button("Restart login"):
+        st.session_state.oauth_step = "run_step1"
+        st.rerun()
+
+    # --- step 1 of 2: authorisation code -> short-lived token (~1 hour) --------
+    if st.session_state.oauth_step == "run_step1":
+        st.markdown("### Step 1 of 2 — exchange the authorisation code for a short-lived token")
+        with st.spinner("Calling api.instagram.com/oauth/access_token…"):
+            short = exchange_code_for_short_token(st.session_state.oauth_code)
+        st.session_state.oauth_short_result = short
+        entry = _latest_log_entry()
+        if entry:
+            _render_call_detail(entry)
+
+        if "access_token" not in short:
+            st.error(f"Token exchange failed: {short}")
+            if st.button("Restart login", key="restart_step1"):
+                _reset_oauth_state()
+                st.rerun()
+            st.stop()
+
+        st.success("Short-lived token received (valid ~1 hour).")
+        if st.button("Next → exchange for the long-lived token",
+                     use_container_width=True, key="next_step2"):
+            st.session_state.oauth_step = "run_step2"
             st.rerun()
         st.stop()
 
-    with st.status("Connecting to Instagram…", expanded=True) as status:
-        st.write("Exchanging code for a short-lived token…")
-        short = exchange_code_for_short_token(code)
-        st.query_params.clear()  # burn the one-time code immediately
-        if "access_token" not in short:
-            status.update(label="Failed", state="error")
-            st.error(f"Token exchange failed: {short}")
-            st.stop()
-        st.write("Upgrading to a long-lived token (≈60 days)…")
-        long = exchange_for_long_lived_token(short["access_token"])
+    # --- step 2 of 2: short-lived token -> long-lived token (~60 days) ---------
+    if st.session_state.oauth_step == "run_step2":
+        st.markdown("### Step 2 of 2 — exchange the short-lived token for a long-lived token")
+        short_token = st.session_state.oauth_short_result["access_token"]
+        with st.spinner("Calling graph.instagram.com/access_token…"):
+            long = exchange_for_long_lived_token(short_token)
+        st.session_state.oauth_long_result = long
+        entry = _latest_log_entry()
+        if entry:
+            _render_call_detail(entry)
+
         if "access_token" not in long:
-            status.update(label="Failed", state="error")
             st.error(f"Long-lived token exchange failed: {long}")
+            if st.button("Restart login", key="restart_step2"):
+                _reset_oauth_state()
+                st.rerun()
             st.stop()
+
         expires_in = long.get("expires_in", 0)
-        st.session_state.access_token = long["access_token"]
-        st.session_state.token_meta = {
-            "permissions": short.get("permissions", ""),
-            "token_expires_at": (
-                datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-            ).isoformat(),
-        }
-        status.update(label="Connected", state="complete")
-    st.rerun()
+        st.success(f"Long-lived token received — expires in ~{round(expires_in / 86400)} days. "
+                   f"This is the only token the rest of the app uses; nothing further is "
+                   f"exchanged automatically (refresh_long_lived_token exists in section 3 "
+                   f"for when you persist tokens, but login itself needed only these two calls).")
+        if st.button("Next → finish login and load the dashboard",
+                     use_container_width=True, key="finish_login"):
+            st.session_state.access_token = long["access_token"]
+            st.session_state.token_meta = {
+                "permissions": st.session_state.oauth_short_result.get("permissions", ""),
+                "token_expires_at": (
+                    datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                ).isoformat(),
+            }
+            _reset_oauth_state()
+            st.rerun()
+        st.stop()
 
 # --- Data load --------------------------------------------------------------
 token = st.session_state.access_token
@@ -1528,14 +1410,13 @@ _window_opts = [7, 30, 90]
 if hasattr(st, "segmented_control"):
     _picked = st.segmented_control("Insights window (days)", _window_opts,
                                    default=WINDOW_DAYS)
-else:  # older Streamlit fallback
+else:
     _picked = st.radio("Insights window (days)", _window_opts,
                        index=_window_opts.index(WINDOW_DAYS), horizontal=True)
 window_days = _picked or WINDOW_DAYS
 
-# --- Window alignment: which "last N days" convention to use -----------------
 if st.session_state.get("win_align") not in WINDOW_ALIGN_MODES:
-    st.session_state.pop("win_align", None)  # labels changed in v5 — drop stale state
+    st.session_state.pop("win_align", None)
 with st.expander("Window alignment — for matching the native app's date range"):
     _align_label = st.selectbox("Day boundary mode", list(WINDOW_ALIGN_MODES),
                                 index=0, key="win_align")
@@ -1582,7 +1463,6 @@ with st.spinner("Loading profile and account insights…"):
     follower_series = fetch_timeseries(token, ig_user_id, "follower_count",
                                        window_days, win_align, win_tz_h)
 
-# Per-media type-specific insights (watch time, skip rate, follows, visits)
 extras: dict[str, dict] = {}
 enrich = posts[:MAX_ENRICHED_MEDIA]
 if enrich:
@@ -1665,8 +1545,8 @@ elif not posts:
                "still move because older posts, reels, and stories keep earning "
                "views, reach, and interactions after publication.")
 
-tab_overview, tab_reels, tab_feed, tab_audience, tab_data = st.tabs(
-    ["Overview", "Reels", "Feed posts", "Audience", "Data"])
+tab_overview, tab_reels, tab_feed, tab_audience, tab_data, tab_sequence = st.tabs(
+    ["Overview", "Reels", "Feed posts", "Audience", "Data", "Sequential execution"])
 
 # --- OVERVIEW ---------------------------------------------------------------
 with tab_overview:
@@ -1699,15 +1579,12 @@ with tab_overview:
         if fu_total:
             fu_display, fu_sub = fmt_int(fu_total), breakdown_txt or "as reported by Meta"
         else:
-            # Meta returned breakdown rows but no combined total — showing 0
-            # would be a lie, so show a dash and let the breakdown speak.
             fu_display = "—"
             fu_sub = f"{breakdown_txt} (Meta returned no combined total; " \
                      f"breakdown semantics undocumented)"
         kpis.append(render_kpi("Follows & unfollows", fu_display, fu_sub))
     st.markdown(f'<div class="kpi-grid">{"".join(kpis)}</div>', unsafe_allow_html=True)
 
-    # --- The v1 metric cells: same numbers, same formulas, always visible ---
     st.markdown('<div class="section-eyebrow">Engagement rates — the five metrics '
                 'your schema stores</div>', unsafe_allow_html=True)
     v1_cells = "".join([
@@ -1750,13 +1627,11 @@ with tab_overview:
         f"debug). Views total_value: {fmt_int(total_of('views', fmt_totals))}."
     )
 
-    # --- Profile link taps by button (new — was only a flat total before) ---
     _plt_by = (plr_totals.get("profile_links_taps") or {}).get("by", {})
     if _plt_by:
         st.markdown(render_pct_block("Profile link taps by button", _plt_by),
                     unsafe_allow_html=True)
 
-    # --- Native-style content-type split (matches the in-app Account insights) ---
     st.markdown('<div class="section-eyebrow">By content type — like the native '
                 'Account insights</div>', unsafe_allow_html=True)
     _views_by = (fmt_totals.get("views") or {}).get("by", {})
@@ -1782,7 +1657,6 @@ with tab_overview:
         st.caption("Followers vs non-followers split: not returned by Meta for this "
                    "account/window — details in Data → API warnings.")
 
-    # Signature element: the format split, from Meta's own account-level breakdown
     st.markdown('<div class="section-eyebrow">Reels vs Feed — Meta\'s account-level split</div>',
                 unsafe_allow_html=True)
     rows_l, rows_r = [], []
@@ -2117,3 +1991,114 @@ with tab_data:
             st.write("None — every call succeeded.")
     st.caption(f"Token expires: {token_meta.get('token_expires_at', '—')} · "
                f"refresh_long_lived_token() is included for when you persist tokens.")
+
+# --- SEQUENTIAL EXECUTION (every network call, in the order it ran) --------
+with tab_sequence:
+    st.markdown('<div class="section-eyebrow">Every network call this app has made, '
+                'in order — starting with the OAuth token exchange</div>',
+                unsafe_allow_html=True)
+    st.caption(
+        "Only calls that actually went over the network show up here. Most "
+        "reruns (changing a filter, switching tabs) hit @st.cache_data instead "
+        "and add nothing — that's expected, not a gap. New rows appear on "
+        "first login, on 'Refresh data', or when a control (like the days "
+        "window) changes to a value that hasn't been fetched yet this "
+        "session. access_token and client_secret values are masked wherever "
+        "they appear, in requests and responses — see the comment above "
+        "_log_api_call in the source for exactly what that does and does not "
+        "touch. Everything else, including the complete response body, is "
+        "exactly what Meta returned — nothing computed or filtered."
+    )
+
+    log = st.session_state.get("api_call_log", [])
+
+    total_calls = len(log)
+    error_calls = sum(1 for e in log if e["status_code"] >= 400)
+    avg_ms = round(sum(e["elapsed_ms"] for e in log) / total_calls, 1) if total_calls else 0.0
+    unique_endpoints = len({e["endpoint"] for e in log})
+
+    kpi_html = "".join([
+        render_kpi("Total API calls", str(total_calls),
+                   "every network hit this browser session, in sequence", hero=True),
+        render_kpi("Unique endpoints", str(unique_endpoints)),
+        render_kpi("Calls that errored", str(error_calls), "HTTP status ≥ 400"),
+        render_kpi("Avg response time", f"{avg_ms} ms" if total_calls else "—"),
+    ])
+    st.markdown(f'<div class="kpi-grid">{kpi_html}</div>', unsafe_allow_html=True)
+
+    bcol1, bcol2, _bcol3 = st.columns([1, 1, 4])
+    with bcol1:
+        if st.button("Clear log", key="clear_api_log", use_container_width=True):
+            st.session_state.api_call_log = []
+            st.rerun()
+    with bcol2:
+        st.download_button(
+            "Download JSON",
+            data=json.dumps(log, indent=2, default=str),
+            file_name=f"api_call_log_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json",
+            mime="application/json",
+            disabled=not log,
+            key="download_api_log",
+            use_container_width=True,
+        )
+
+    if not log:
+        st.info("No network calls logged yet this session. If you're testing this "
+                "on an account that was already connected before this tab existed, "
+                "click Disconnect and log in again — the OAuth exchange calls only "
+                "get captured if they happen while this code is running.")
+    else:
+        st.markdown('<div class="section-eyebrow">Calls per endpoint</div>',
+                    unsafe_allow_html=True)
+        endpoint_counts: dict[str, int] = {}
+        for e in log:
+            endpoint_counts[e["endpoint"]] = endpoint_counts.get(e["endpoint"], 0) + 1
+        endpoint_df = pd.DataFrame(
+            sorted(endpoint_counts.items(), key=lambda kv: -kv[1]),
+            columns=["endpoint", "calls"])
+        st.dataframe(endpoint_df, use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="section-eyebrow">Calls in order</div>', unsafe_allow_html=True)
+        show_filter = st.radio("Show", ["All calls", "Errors only"],
+                               horizontal=True, key="api_log_filter")
+        filtered = ([e for e in log if e["status_code"] >= 400]
+                    if show_filter == "Errors only" else log)
+        table_df = pd.DataFrame([{
+            "#": e["seq"], "time (UTC)": e["ts"], "method": e["method"],
+            "endpoint": e["endpoint"], "status": e["status_code"], "ms": e["elapsed_ms"],
+        } for e in filtered])
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="section-eyebrow">Full request and response for one '
+                    'call</div>', unsafe_allow_html=True)
+        if filtered:
+            seqs = [e["seq"] for e in filtered]
+            pick = st.selectbox("Call #", seqs, index=len(seqs) - 1,
+                                key=f"api_log_pick_{show_filter}")
+            entry = next(e for e in log if e["seq"] == pick)
+            st.caption(f"{entry['method']} · {entry['endpoint']} · "
+                       f"HTTP {entry['status_code']} · {entry['elapsed_ms']} ms · "
+                       f"{entry['ts']}")
+            st.text_input("Request URL", entry["url"], disabled=True, key="api_log_url")
+            if entry["request_body"]:
+                st.text_area("Request body", entry["request_body"], disabled=True,
+                             height=100, key="api_log_body")
+
+            usage_headers = {k: v for k, v in entry.get("response_headers", {}).items()
+                             if "usage" in k.lower() or "rate" in k.lower()}
+            if usage_headers:
+                st.caption("Rate/usage headers Meta returned on this call: " +
+                          " · ".join(f"{k}: {v}" for k, v in usage_headers.items()))
+
+            st.markdown("**Full response body — exactly as Meta sent it**")
+            try:
+                st.json(json.loads(entry["response_text"]))
+            except (ValueError, TypeError):
+                st.code(entry["response_text"] or "(empty body)")
+
+            with st.expander("Raw response text"):
+                st.code(entry["response_text"] or "(empty body)")
+            with st.expander("All response headers"):
+                st.json(entry.get("response_headers", {}))
+        else:
+            st.info("No calls match this filter.")
