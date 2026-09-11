@@ -1371,6 +1371,9 @@ def _fixture_plan(uid: str, token: str, media_id: str | None) -> list[dict]:
              "params": {"metric": ("views,reach,saved,shares,reposts,"
                                    "total_interactions")}})
     return plan
+
+
+def _code_is_spent(code: str) -> bool:
     return code in st.session_state.get("oauth_spent_codes", [])
 
 
