@@ -1313,6 +1313,26 @@ if "access_token" not in st.session_state:
         code = st.query_params.get("code")
         returned_state = st.query_params.get("state")
 
+        # Canceled/denied authorization: Instagram redirects with error /
+        # error_reason / error_description instead of code (doc: "Canceled
+        # authorization" — "it is your responsibility to fail gracefully").
+        # Previously unhandled: an absent `code` was treated identically to
+        # "login not yet started", so a denial silently re-showed the login
+        # button with no explanation.
+        oauth_error = st.query_params.get("error")
+        if oauth_error:
+            error_reason = st.query_params.get("error_reason", oauth_error)
+            error_description = (st.query_params.get("error_description", "")
+                                 .replace("+", " ")) or "No further detail was given."
+            st.query_params.clear()
+            st.error(f"Instagram login was not completed — {error_reason}: "
+                     f"{error_description}")
+            st.session_state.oauth_state = pysecrets.token_urlsafe(16)
+            st.link_button("Try logging in again",
+                           build_authorize_url(st.session_state.oauth_state),
+                           use_container_width=True)
+            st.stop()
+
         if not code:
             st.session_state.oauth_state = pysecrets.token_urlsafe(16)
             st.info("Connect an Instagram professional account to see its insights — "
