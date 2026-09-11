@@ -1270,9 +1270,36 @@ def _latest_log_entry() -> dict | None:
     return log[-1] if log else None
 
 
+def _code_is_spent(code: str) -> bool:
+    return code in st.session_state.get("oauth_spent_codes", [])
+
+
+def _mark_code_spent(code: str) -> None:
+    """Records an authorisation code as sent to the token endpoint.
+
+    Called BEFORE the request goes out, not after, because what makes a code
+    unusable is Meta receiving it — not the response coming back. Marking on
+    success would leave a window where a crash, timeout, or refresh mid-flight
+    loses the record while Meta has already burned the code.
+
+    Deliberately NOT cleared by _reset_oauth_state: this is a record of what
+    has already happened on the wire, and no button in this app can un-spend a
+    code. Clearing it would reopen the exact double-spend this guards against.
+    """
+    st.session_state.setdefault("oauth_spent_codes", [])
+    if code not in st.session_state.oauth_spent_codes:
+        st.session_state.oauth_spent_codes.append(code)
+
+
 def _reset_oauth_state() -> None:
-    for k in ("oauth_step", "oauth_code", "oauth_short_result",
-              "oauth_long_result", "oauth_state"):
+    """Clears every key the login step-through writes. The memoisation guards
+    in the gate key off the *absence* of oauth_short_result / oauth_long_result,
+    so missing one of these on reset would silently replay a previous login's
+    stored response instead of making a fresh call — worse than no memoisation
+    at all. Keep this list in sync with what the gate writes."""
+    for k in ("oauth_step", "oauth_code", "oauth_callback_params",
+              "oauth_authorize_url", "oauth_short_result", "oauth_short_entry",
+              "oauth_long_result", "oauth_long_entry", "oauth_state"):
         st.session_state.pop(k, None)
 
 
@@ -1307,6 +1334,11 @@ if "access_token" not in st.session_state:
                f"Dashboard registration character for character.")
 
     st.session_state.setdefault("oauth_step", "await_code")
+
+    _STEP_LABELS = {"show_code": 1, "run_short": 2, "run_long": 3}
+    if st.session_state.oauth_step in _STEP_LABELS:
+        st.progress(_STEP_LABELS[st.session_state.oauth_step] / 3.0,
+                    text=f"Login step {_STEP_LABELS[st.session_state.oauth_step]} of 3")
 
     # --- await_code: no API call yet, just the login link or a fresh redirect ---
     if st.session_state.oauth_step == "await_code":
@@ -1353,51 +1385,141 @@ if "access_token" not in st.session_state:
                 st.rerun()
             st.stop()
 
-        # Stash the one-time code before clearing the URL — it won't survive
-        # the reruns the Next buttons below trigger, and it can only be used once.
-        st.session_state.oauth_code = code
+        # A code that has already been sent to the token endpoint cannot be
+        # exchanged again — Meta answers "This authorization code has been
+        # used". Re-entry here with the same code is not hypothetical: browser
+        # Back, a refresh that replays the callback URL, a restored tab, a
+        # second tab, or a Streamlit session reset (cloud reboot, websocket
+        # reconnect) all drop the script back into await_code with the original
+        # URL intact. Without this guard the app would re-spend the code and
+        # turn a login that already worked into a 400.
+        if _code_is_spent(code.split("#")[0]):
+            st.query_params.clear()
+            st.warning("This authorisation code was already exchanged earlier in "
+                       "this session. Codes are single-use, so it can't be "
+                       "exchanged again — start a fresh login to get a new one.")
+            st.session_state.oauth_state = pysecrets.token_urlsafe(16)
+            st.link_button("Start a fresh login",
+                           build_authorize_url(st.session_state.oauth_state),
+                           use_container_width=True)
+            st.stop()
+
+        # Stash the one-time code AND the whole callback query string before
+        # clearing the URL — neither survives the reruns the Next buttons
+        # below trigger, and the code can only be spent once.
+        # The doc notes Instagram appends "#_" to the redirect URI; that's a
+        # URL fragment, which browsers never send to the server, so Streamlit
+        # won't see it. Stripped anyway — costs nothing, and it means a
+        # hand-pasted callback URL also works.
+        st.session_state.oauth_code = code.split("#")[0]
+        st.session_state.oauth_callback_params = dict(st.query_params)
+        st.session_state.oauth_authorize_url = build_authorize_url(
+            st.session_state.get("oauth_state", ""))
         st.query_params.clear()
-        st.session_state.oauth_step = "run_step1"
+        st.session_state.oauth_step = "show_code"
         st.rerun()
 
-    # --- step 1 of 2: authorisation code -> short-lived token (~1 hour) --------
-    if st.session_state.oauth_step == "run_step1":
-        st.markdown("### Step 1 of 2 — exchange the authorisation code for a short-lived token")
-        with st.spinner("Calling api.instagram.com/oauth/access_token…"):
-            short = exchange_code_for_short_token(st.session_state.oauth_code)
-        st.session_state.oauth_short_result = short
-        entry = _latest_log_entry()
-        if entry:
-            _render_call_detail(entry)
+    # --- step 1 of 3: the authorisation code Instagram sent to the callback ---
+    # No outgoing call from this app happens here — the authorize step runs in
+    # the user's browser and comes back as a redirect, so there is nothing for
+    # the SESSION response hook to log. What's shown below is the authorize URL
+    # this app built and sent the user to, and the exact query string Instagram
+    # redirected back with. Labelled as such rather than dressed up as an API
+    # call, because it isn't one.
+    if st.session_state.oauth_step == "show_code":
+        st.markdown("### Step 1 of 3 — authorisation code received at the callback")
+        st.caption("Browser redirect, not a server-side API call — so this step "
+                   "adds no row to the Sequential execution tab. Steps 2 and 3 do.")
+        st.text_input("Authorize endpoint the user was sent to",
+                      st.session_state.get("oauth_authorize_url", ""),
+                      disabled=True, key="oauth_authorize_url_box")
+        st.markdown("**Callback query string — exactly as Instagram returned it**")
+        st.json(st.session_state.get("oauth_callback_params", {}))
+        st.text_input("Authorisation code (single-use, valid 1 hour)",
+                      st.session_state.oauth_code, disabled=True,
+                      key="oauth_code_box")
+        st.warning("Shown in full because you asked to see it. It is a live "
+                   "credential until step 2 spends it — don't screenshot this "
+                   "panel into anywhere public.")
+        if st.button("Next → exchange this code for a short-lived token",
+                     use_container_width=True, key="next_short"):
+            st.session_state.oauth_step = "run_short"
+            st.rerun()
+        st.stop()
+
+    # --- step 2 of 3: authorisation code -> short-lived token (~1 hour) --------
+    # MEMOISED, and that is load-bearing, not tidiness. The doc is explicit that
+    # the authorisation code "can only be used once"; spend it twice and Meta
+    # returns "Matching code was not found or was already used". Any Streamlit
+    # rerun that lands back in this block — a widget interaction, a browser
+    # refresh, a stray keypress — would fire a second exchange on a burned code
+    # and turn a working login into a hard failure. Storing the result and the
+    # log entry means the call happens exactly once per login; every later
+    # render replays what was stored.
+    if st.session_state.oauth_step == "run_short":
+        st.markdown("### Step 2 of 3 — exchange the authorisation code for a short-lived token")
+        _this_code = st.session_state.oauth_code
+        if "oauth_short_result" not in st.session_state:
+            if _code_is_spent(_this_code):
+                # Belt and braces: the memo is missing but the wire record says
+                # this code already went out. Sending it again can only 400.
+                st.error("This authorisation code has already been sent to the "
+                         "token endpoint, and the response wasn't kept. Codes "
+                         "are single-use, so it can't be retried.")
+                if st.button("Start a fresh login", key="restart_spent"):
+                    _reset_oauth_state()
+                    st.rerun()
+                st.stop()
+            _mark_code_spent(_this_code)
+            with st.spinner("Calling api.instagram.com/oauth/access_token…"):
+                st.session_state.oauth_short_result = exchange_code_for_short_token(
+                    _this_code)
+            st.session_state.oauth_short_entry = _latest_log_entry()
+        short = st.session_state.oauth_short_result
+        if st.session_state.get("oauth_short_entry"):
+            _render_call_detail(st.session_state.oauth_short_entry)
 
         if "access_token" not in short:
-            st.error(f"Token exchange failed: {short}")
-            if st.button("Restart login", key="restart_step1"):
+            st.error(f"POST api.instagram.com/oauth/access_token failed: {short}")
+            if "has been used" in str(short).lower() or "already used" in str(short).lower():
+                st.info("Meta is saying this code was already exchanged. The code "
+                        "is gone either way — retrying it cannot succeed. Start a "
+                        "fresh login; the new code will work. If this keeps "
+                        "happening on the first attempt, something is replaying "
+                        "the callback URL — check for a browser extension or an "
+                        "auto-refresh on the page.")
+            if st.button("Start a fresh login", key="restart_short"):
                 _reset_oauth_state()
                 st.rerun()
             st.stop()
 
         st.success("Short-lived token received (valid ~1 hour).")
         if st.button("Next → exchange for the long-lived token",
-                     use_container_width=True, key="next_step2"):
-            st.session_state.oauth_step = "run_step2"
+                     use_container_width=True, key="next_long"):
+            st.session_state.oauth_step = "run_long"
             st.rerun()
         st.stop()
 
-    # --- step 2 of 2: short-lived token -> long-lived token (~60 days) ---------
-    if st.session_state.oauth_step == "run_step2":
-        st.markdown("### Step 2 of 2 — exchange the short-lived token for a long-lived token")
-        short_token = st.session_state.oauth_short_result["access_token"]
-        with st.spinner("Calling graph.instagram.com/access_token…"):
-            long = exchange_for_long_lived_token(short_token)
-        st.session_state.oauth_long_result = long
-        entry = _latest_log_entry()
-        if entry:
-            _render_call_detail(entry)
+    # --- step 3 of 3: short-lived token -> long-lived token (~60 days) ---------
+    # Memoised for the same reason as step 2. This one is less fragile (the
+    # short-lived token is reusable until it expires, so a repeat call would
+    # succeed rather than error) but a silent duplicate call still muddies the
+    # sequential log, which is the whole point of that tab.
+    if st.session_state.oauth_step == "run_long":
+        st.markdown("### Step 3 of 3 — exchange the short-lived token for a long-lived token")
+        if "oauth_long_result" not in st.session_state:
+            with st.spinner("Calling graph.instagram.com/access_token…"):
+                st.session_state.oauth_long_result = exchange_for_long_lived_token(
+                    st.session_state.oauth_short_result["access_token"])
+            st.session_state.oauth_long_entry = _latest_log_entry()
+        long = st.session_state.oauth_long_result
+        if st.session_state.get("oauth_long_entry"):
+            _render_call_detail(st.session_state.oauth_long_entry)
 
         if "access_token" not in long:
-            st.error(f"Long-lived token exchange failed: {long}")
-            if st.button("Restart login", key="restart_step2"):
+            st.error(f"GET graph.instagram.com/access_token "
+                     f"(grant_type=ig_exchange_token) failed: {long}")
+            if st.button("Restart login", key="restart_long"):
                 _reset_oauth_state()
                 st.rerun()
             st.stop()
@@ -1406,8 +1528,9 @@ if "access_token" not in st.session_state:
         st.success(f"Long-lived token received — expires in ~{round(expires_in / 86400)} days. "
                    f"This is the only token the rest of the app uses; nothing further is "
                    f"exchanged automatically (refresh_long_lived_token exists in section 3 "
-                   f"for when you persist tokens, but login itself needed only these two calls).")
-        if st.button("Next → finish login and load the dashboard",
+                   f"for when you persist tokens, but login itself needed only these two "
+                   f"server-side calls).")
+        if st.button("Finish → load the dashboard",
                      use_container_width=True, key="finish_login"):
             st.session_state.access_token = long["access_token"]
             st.session_state.token_meta = {
