@@ -86,11 +86,13 @@ Dependencies: streamlit>=1.41, requests, python-dotenv
 from __future__ import annotations
 
 import html
+import io
 import json
 import os
 import re
 import secrets as pysecrets
 import statistics
+import zipfile
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlparse
 
@@ -1270,7 +1272,105 @@ def _latest_log_entry() -> dict | None:
     return log[-1] if log else None
 
 
-def _code_is_spent(code: str) -> bool:
+FIXTURE_DIR = "extra/trash/executing-now/07-social-connect/fixtures"
+FIXTURE_WINDOW_DAYS = 30
+
+
+def _fixture_window() -> tuple[int, int]:
+    """Thirty complete days ending at the last UTC midnight — the window the
+    capture spec asks for, and the same convention the dashboard defaults to,
+    so captured fixtures and displayed numbers describe the same period."""
+    ranges = _chunk_ranges(FIXTURE_WINDOW_DAYS, align="complete_days", tz_h=0.0)
+    return ranges[0][0], ranges[-1][1]
+
+
+def _fixture_get(url: str, params: dict) -> dict:
+    """One call, response body captured VERBATIM.
+
+    The rest of this file parses JSON into dicts and re-serialises for display,
+    which silently normalises key order, whitespace, and unicode escaping. The
+    capture spec's whole point is seeing what Meta actually sends, so this
+    keeps response.text as the raw string and never round-trips it through
+    json.loads/json.dumps. The request URL IS masked for display because it
+    carries the access token as a query parameter; response bodies are not
+    touched.
+    """
+    try:
+        r = SESSION.get(url, params=params, timeout=30)
+    except requests.RequestException as exc:
+        return {"status": None, "raw": "", "url": "", "ms": None,
+                "transport_error": str(exc)}
+    return {"status": r.status_code, "raw": r.text,
+            "url": _redact_secrets(r.url),
+            "ms": round(r.elapsed.total_seconds() * 1000, 1),
+            "transport_error": None}
+
+
+def _fixture_plan(uid: str, token: str, media_id: str | None) -> list[dict]:
+    """The capture spec as data. Numbering matches the spec document so a
+    captured file can be traced back to the row that asked for it."""
+    since, until = _fixture_window()
+    media_fields_ok = (
+        "id,timestamp,permalink,caption,media_type,media_product_type,"
+        "media_url,thumbnail_url,like_count,comments_count,"
+        "insights.metric(views,reach,saved,shares,reposts,total_interactions)"
+    )
+    # Call 6 deliberately asks for a metric Meta removed. The point is to
+    # capture the real error body so the retry-and-drop logic in _totals_single
+    # and fetch_common_media_insights can be written against Meta's actual
+    # wording instead of a guess about it.
+    media_fields_bad = media_fields_ok.replace(
+        "total_interactions)", "total_interactions,impressions)")
+    plan = [
+        {"n": 1, "file": "identity.json", "must": True,
+         "what": "Identity — the only call that returns user_id",
+         "path": "me", "token": token,
+         "params": {"fields": "id,user_id,username,name"}},
+        {"n": 2, "file": "profile.json", "must": True,
+         "what": "Profile fields",
+         "path": uid, "token": token,
+         "params": {"fields": ("account_type,biography,website,"
+                               "profile_picture_url,followers_count,"
+                               "follows_count,media_count")}},
+        {"n": 3, "file": "media-page.json", "must": True,
+         "what": "Media page with nested insights — the deepest shape, "
+                 "and the one with the paging cursor",
+         "path": f"{uid}/media", "token": token,
+         "params": {"fields": media_fields_ok, "limit": 50}},
+        {"n": 4, "file": "reach-plain.json", "must": True,
+         "what": "Reach, no breakdown",
+         "path": f"{uid}/insights", "token": token,
+         "params": {"metric": "reach", "period": "day",
+                    "metric_type": "total_value",
+                    "since": since, "until": until}},
+        {"n": 5, "file": "reach-by-format.json", "must": True,
+         "what": "Reach and friends, broken down by media_product_type",
+         "path": f"{uid}/insights", "token": token,
+         "params": {"metric": ("reach,views,likes,comments,saves,shares,"
+                               "total_interactions"),
+                    "period": "day", "metric_type": "total_value",
+                    "breakdown": "media_product_type",
+                    "since": since, "until": until}},
+        {"n": 6, "file": "error-deprecated-metric.json", "must": True,
+         "what": "Call 3 plus `impressions` — expected to FAIL; the error "
+                 "body is the artefact",
+         "path": f"{uid}/media", "token": token,
+         "params": {"fields": media_fields_bad, "limit": 50}},
+        {"n": 7, "file": "error-bad-token.json", "must": True,
+         "what": "Call 1 with a corrupted token — expected to FAIL",
+         "path": "me",
+         "token": (token[:-8] + "XXXXXXXX") if len(token) > 8 else "INVALID",
+         "params": {"fields": "id,user_id,username,name"}},
+    ]
+    if media_id:
+        plan.append(
+            {"n": 8, "file": "media-insights-single.json", "must": False,
+             "what": "Per-post insights — the fallback used when call 3's "
+                     "field expansion is rejected",
+             "path": f"{media_id}/insights", "token": token,
+             "params": {"metric": ("views,reach,saved,shares,reposts,"
+                                   "total_interactions")}})
+    return plan
     return code in st.session_state.get("oauth_spent_codes", [])
 
 
@@ -1688,8 +1788,10 @@ elif not posts:
                "still move because older posts, reels, and stories keep earning "
                "views, reach, and interactions after publication.")
 
-tab_overview, tab_reels, tab_feed, tab_audience, tab_data, tab_sequence = st.tabs(
-    ["Overview", "Reels", "Feed posts", "Audience", "Data", "Sequential execution"])
+(tab_overview, tab_reels, tab_feed, tab_audience, tab_data, tab_sequence,
+ tab_fixtures) = st.tabs(
+    ["Overview", "Reels", "Feed posts", "Audience", "Data",
+     "Sequential execution", "Fixture capture"])
 
 # --- OVERVIEW ---------------------------------------------------------------
 with tab_overview:
@@ -2212,8 +2314,57 @@ with tab_sequence:
         } for e in filtered])
         st.dataframe(table_df, use_container_width=True, hide_index=True)
 
-        st.markdown('<div class="section-eyebrow">Full request and response for one '
-                    'call</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-eyebrow">Full sequence — every call, in '
+                    'order, with the raw response it returned</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Each row below is one network call, numbered in the order it "
+            "actually happened: the OAuth exchanges first, then every data "
+            "call the dashboard made after login. Open one to see the request "
+            "URL, the request body, and the complete response exactly as Meta "
+            "sent it."
+        )
+        # Rendering is capped by default because per-post enrichment can make
+        # up to two calls per media item (MAX_ENRICHED_MEDIA = 80, so ~160
+        # calls on a feed-heavy account). Streamlit builds an expander's
+        # contents whether or not it's open, so rendering all of them
+        # unconditionally would make this tab slow to draw for exactly the
+        # accounts that most need inspecting. The cap is a UI control, not a
+        # limit on what's logged — the table above and the JSON download always
+        # cover every call.
+        _seq_c1, _seq_c2 = st.columns([1, 3])
+        with _seq_c1:
+            _render_n = st.selectbox("Render", [10, 25, 50, "All"], index=1,
+                                     key="api_log_render_n",
+                                     help="How many of the calls below to draw. "
+                                          "Downloads and counts are unaffected.")
+        with _seq_c2:
+            _newest_first = st.checkbox("Newest first", value=False,
+                                        key="api_log_newest_first")
+
+        _ordered = list(reversed(filtered)) if _newest_first else filtered
+        _to_render = _ordered if _render_n == "All" else _ordered[:int(_render_n)]
+
+        for e in _to_render:
+            _flag = "❌" if e["status_code"] >= 400 else "✅"
+            with st.expander(f"{_flag} #{e['seq']} · {e['method']} {e['endpoint']} "
+                             f"· HTTP {e['status_code']} · {e['elapsed_ms']} ms"):
+                st.text_input("Request URL", e["url"], disabled=True,
+                              key=f"seq_url_{e['seq']}")
+                if e["request_body"]:
+                    st.text_area("Request body", e["request_body"], disabled=True,
+                                 height=80, key=f"seq_body_{e['seq']}")
+                st.markdown("**Raw response — exactly as Meta sent it**")
+                try:
+                    st.json(json.loads(e["response_text"]))
+                except (ValueError, TypeError):
+                    st.code(e["response_text"] or "(empty body)")
+        if _render_n != "All" and len(_ordered) > len(_to_render):
+            st.caption(f"Showing {len(_to_render)} of {len(_ordered)} calls — "
+                       f"raise 'Render' or use Download JSON for the rest.")
+
+        st.markdown('<div class="section-eyebrow">Jump to one call</div>',
+                    unsafe_allow_html=True)
         if filtered:
             seqs = [e["seq"] for e in filtered]
             pick = st.selectbox("Call #", seqs, index=len(seqs) - 1,
@@ -2245,3 +2396,176 @@ with tab_sequence:
                 st.json(entry.get("response_headers", {}))
         else:
             st.info("No calls match this filter.")
+
+# --- FIXTURE CAPTURE -------------------------------------------------------
+# Implements the seven must-have calls (plus the per-post fallback) from the
+# capture spec, saving each response body VERBATIM — no pretty-printing, no
+# reformatting, no trimming — because the entire purpose is seeing what Meta
+# actually sends, not what this app's parsers make of it.
+with tab_fixtures:
+    st.markdown('<div class="section-eyebrow">Capture raw API responses as test '
+                'fixtures</div>', unsafe_allow_html=True)
+
+    _fx_uid = identity.get("user_id")
+    if not _fx_uid:
+        # Worth being strict here. The dashboard's data load falls back to
+        # identity["id"] when user_id is missing, but the spec states plainly
+        # that `id` is app-scoped and will not work for the other calls — so a
+        # fixture captured against it would look fine and be wrong. Better to
+        # refuse than to hand over a quietly invalid artefact.
+        st.error("`user_id` is missing from the identity response, and the "
+                 "capture spec requires it — `id` is app-scoped and won't "
+                 "work for calls 2-6. Nothing captured. Check call 1 in the "
+                 "Sequential execution tab to see what came back.")
+        st.stop()
+
+    _fx_since, _fx_until = _fixture_window()
+    st.caption(
+        f"Window: 30 complete days ending at the last UTC midnight — "
+        f"`since={_fx_since}` `until={_fx_until}` "
+        f"({window_bounds_label(FIXTURE_WINDOW_DAYS, 'complete_days', 0.0)}). "
+        f"ig_user_id in use: `{_fx_uid}` (the `user_id` field from call 1, not "
+        f"`id`). Every call below also lands in the Sequential execution tab, "
+        f"since it goes through the same session."
+    )
+
+    _fx_media_id = posts[0]["id"] if posts else None
+    _fx_plan_preview = _fixture_plan(_fx_uid, token, _fx_media_id)
+
+    st.markdown('<div class="section-eyebrow">What will be called</div>',
+                unsafe_allow_html=True)
+    st.dataframe(
+        pd.DataFrame([{
+            "#": p["n"],
+            "file": p["file"],
+            "must-have": "yes" if p["must"] else "nice-to-have",
+            "endpoint": f"/{p['path']}",
+            "what": p["what"],
+        } for p in _fx_plan_preview]),
+        use_container_width=True, hide_index=True)
+
+    if not _fx_media_id:
+        st.caption("Call 8 (per-post fallback) is skipped — no posts in the "
+                   "current window to take a media_id from. Widen the window "
+                   "selector above and it'll appear.")
+    _fx_reels_n, _fx_feed_n = len(reels), len(feed)
+    if _fx_reels_n and _fx_feed_n:
+        st.success(f"Call 3 will contain both formats ({_fx_reels_n} reel(s), "
+                   f"{_fx_feed_n} feed post(s)) — which is what the spec asks for.")
+    else:
+        st.warning(f"Call 3's window currently holds {_fx_reels_n} reel(s) and "
+                   f"{_fx_feed_n} feed post(s). The spec wants both present so "
+                   f"the fixture covers each shape. Capturing anyway is fine, "
+                   f"but a wider window may give a more representative file.")
+
+    st.markdown('<div class="section-eyebrow">Run the capture</div>',
+                unsafe_allow_html=True)
+    st.info(
+        "These are real, uncached network calls — pressing the button hits "
+        "Meta directly, bypassing @st.cache_data so the bodies are fresh "
+        "rather than replayed from cache. Calls 6 and 7 are *supposed* to "
+        "fail; their error bodies are the artefact. Nothing here writes to "
+        "your account — every call is a GET."
+    )
+
+    if st.button("Capture fixtures now", type="primary",
+                 use_container_width=True, key="run_fixture_capture"):
+        _fx_plan = _fixture_plan(_fx_uid, token, _fx_media_id)
+        _fx_results = []
+        _fx_prog = st.progress(0.0, text="Capturing…")
+        for _i, _p in enumerate(_fx_plan):
+            _params = dict(_p["params"])
+            _params["access_token"] = _p["token"]
+            _res = _fixture_get(f"{GRAPH_HOST}/{API_VERSION}/{_p['path']}", _params)
+            _fx_results.append({**_p, **_res})
+            _fx_prog.progress((_i + 1) / len(_fx_plan),
+                              text=f"Captured {_p['file']}")
+        _fx_prog.empty()
+        st.session_state.fixture_results = _fx_results
+
+    _fx_out = st.session_state.get("fixture_results")
+    if not _fx_out:
+        st.caption("No capture run yet this session.")
+    else:
+        st.markdown('<div class="section-eyebrow">Results</div>',
+                    unsafe_allow_html=True)
+        # "Expected" is per the spec: 6 and 7 are designed to fail, so a 200
+        # there means the capture did NOT produce the error body that was
+        # asked for. Flagging that explicitly, because a green tick on call 6
+        # would be a silent failure of the whole exercise.
+        _rows = []
+        for r in _fx_out:
+            _expect_fail = r["n"] in (6, 7)
+            _failed = r["status"] is None or r["status"] >= 400
+            _rows.append({
+                "#": r["n"], "file": r["file"],
+                "HTTP": r["status"] if r["status"] is not None else "transport error",
+                "bytes": len(r["raw"]),
+                "ms": r["ms"],
+                "as expected": "yes" if _failed == _expect_fail else "NO — check this",
+            })
+        st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+
+        _mismatch = [r for r in _rows if r["as expected"].startswith("NO")]
+        if _mismatch:
+            st.warning(
+                "At least one call didn't behave as the spec expects. Most "
+                "likely: call 6 succeeded, meaning `impressions` was accepted "
+                "rather than rejected for this account — in which case there "
+                "is no deprecation error body to capture, and that fact is "
+                "itself worth recording."
+            )
+
+        _zip_buf = io.BytesIO()
+        with zipfile.ZipFile(_zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
+            for r in _fx_out:
+                # Written as raw bytes of the original text, untouched.
+                _zf.writestr(f"{FIXTURE_DIR}/{r['file']}", r["raw"])
+            _manifest = {
+                "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+                "api_version": API_VERSION,
+                "graph_host": GRAPH_HOST,
+                "ig_user_id_used": _fx_uid,
+                "ig_user_id_source": "identity.user_id (not id)",
+                "window_since_unix": _fx_since,
+                "window_until_unix": _fx_until,
+                "window_convention": "30 complete days ending last UTC midnight",
+                "posts_in_window": {"reels": _fx_reels_n, "feed": _fx_feed_n},
+                "calls": [{
+                    "n": r["n"], "file": r["file"], "what": r["what"],
+                    "request_url_token_masked": r["url"],
+                    "http_status": r["status"], "elapsed_ms": r["ms"],
+                    "expected_to_fail": r["n"] in (6, 7),
+                    "transport_error": r["transport_error"],
+                } for r in _fx_out],
+            }
+            _zf.writestr(f"{FIXTURE_DIR}/_manifest.json",
+                         json.dumps(_manifest, indent=2))
+        st.download_button(
+            "Download fixtures (.zip)",
+            data=_zip_buf.getvalue(),
+            file_name=f"ig-fixtures-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            key="download_fixtures")
+        st.caption(
+            f"Zip contains `{FIXTURE_DIR}/` with each file named exactly as the "
+            f"spec asks, plus `_manifest.json` recording the window, the "
+            f"ig_user_id used, and which calls were expected to fail. Response "
+            f"bodies are byte-for-byte what Meta returned. Request URLs appear "
+            f"only in the manifest, with the access token masked — the token is "
+            f"a live 60-day credential and these files are meant to be shared."
+        )
+
+        st.markdown('<div class="section-eyebrow">Inspect each captured body</div>',
+                    unsafe_allow_html=True)
+        for r in _fx_out:
+            _flag = "❌" if (r["status"] is None or r["status"] >= 400) else "✅"
+            with st.expander(f"{_flag} #{r['n']} · {r['file']} · HTTP {r['status']}"):
+                st.caption(r["what"])
+                st.text_input("Request URL (token masked)", r["url"],
+                              disabled=True, key=f"fx_url_{r['n']}")
+                if r["transport_error"]:
+                    st.error(f"Transport error, no response body: {r['transport_error']}")
+                st.markdown("**Raw body — byte-for-byte as returned**")
+                st.code(r["raw"] or "(empty body)", language="json")
